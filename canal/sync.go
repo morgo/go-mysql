@@ -131,6 +131,7 @@ func (c *Canal) handleEvent(ev *replication.BinlogEvent) error {
 			return errors.Trace(err)
 		}
 	case *replication.GTIDEvent:
+		savePos = true
 		if err := c.eventHandler.OnGTID(ev.Header, e); err != nil {
 			return errors.Trace(err)
 		}
@@ -139,15 +140,13 @@ func (c *Canal) handleEvent(ev *replication.BinlogEvent) error {
 			return errors.Trace(err)
 		}
 	case *replication.QueryEvent:
+		savePos = true
 		stmts, _, err := c.parser.Parse(string(e.Query), "", "")
 		if err != nil {
 			// The parser does not understand all syntax.
 			// For example, it won't parse [CREATE|DROP] TRIGGER statements.
 			c.cfg.Logger.Errorf("parse query(%s) err %v, will skip this event", e.Query, err)
 			return nil
-		}
-		if len(stmts) > 0 {
-			savePos = true
 		}
 		for _, stmt := range stmts {
 			nodes := parseStmt(stmt)
