@@ -79,6 +79,14 @@ type BinlogSyncerConfig struct {
 	// FloatWithTrailingZero structure for floats.
 	UseFloatWithTrailingZero bool
 
+	// RenderJSONAsMySQLText, when true, preserves each JSONB value's
+	// original type tag (DOUBLE 1.0 stays "1.0"; NEWDECIMAL stays
+	// unquoted) in RowsEvent JSON columns. The default decode->json.Marshal
+	// path is lossy for DOUBLE and NEWDECIMAL, which matters when replaying
+	// the output back into a MySQL JSON column. When enabled, UseDecimal
+	// and UseFloatWithTrailingZero have no effect on JSON columns.
+	RenderJSONAsMySQLText bool
+
 	// RecvBufferSize sets the size in bytes of the operating system's receive buffer associated with the connection.
 	RecvBufferSize int
 
@@ -211,6 +219,7 @@ func NewBinlogSyncer(cfg BinlogSyncerConfig) *BinlogSyncer {
 	b.parser.SetTimestampStringLocation(b.cfg.TimestampStringLocation)
 	b.parser.SetUseDecimal(b.cfg.UseDecimal)
 	b.parser.SetUseFloatWithTrailingZero(b.cfg.UseFloatWithTrailingZero)
+	b.parser.SetRenderJSONAsMySQLText(b.cfg.RenderJSONAsMySQLText)
 	b.parser.SetVerifyChecksum(b.cfg.VerifyChecksum)
 	b.parser.SetPayloadDecoderConcurrency(cfg.PayloadDecoderConcurrency)
 	b.parser.SetRowsEventDecodeFunc(b.cfg.RowsEventDecodeFunc)

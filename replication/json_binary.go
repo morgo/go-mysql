@@ -6,7 +6,6 @@ import (
 	"strconv"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/go-mysql-org/go-mysql/utils"
 	"github.com/goccy/go-json"
 	"github.com/pingcap/errors"
 )
@@ -136,177 +135,223 @@ func jsonbGetValueEntrySize(isSmall bool) int {
 	return jsonbValueEntrySizeLarge
 }
 
-// decodeJSONBinary decodes the JSON binary encoding data and returns
-// the common JSON encoding data.
+// decodeJSONBinary decodes the JSON binary encoding data and returns the
+// common JSON encoding data. The JSONB byte stream is walked once and
+// dispatched to a jsonbVisitor: goValueVisitor for the legacy path
+// (build a Go value tree, then json.Marshal it) and mysqlTextVisitor when
+// RenderJSONAsMySQLText is set on the parent RowsEvent (write MySQL's
+// textual JSON form directly, preserving each value's original type tag).
 func (e *RowsEvent) decodeJSONBinary(data []byte) ([]byte, error) {
-	d := jsonBinaryDecoder{
+	if len(data) < 1 {
+		if e.renderJSONAsMySQLText && e.ignoreJSONDecodeErr {
+			return []byte("null"), nil
+		}
+		return nil, errors.New("json binary data is empty")
+	}
+
+	if e.renderJSONAsMySQLText {
+		v := &mysqlTextVisitor{}
+		w := jsonbWalker{visitor: v, ignoreDecodeErr: e.ignoreJSONDecodeErr}
+		w.walkValue(data[0], data[1:])
+		if w.err != nil {
+			return nil, w.err
+		}
+		if v.err != nil {
+			return nil, v.err
+		}
+		return v.buf.Bytes(), nil
+	}
+
+	v := &goValueVisitor{
 		useDecimal:               e.useDecimal,
 		useFloatWithTrailingZero: e.useFloatWithTrailingZero,
-		ignoreDecodeErr:          e.ignoreJSONDecodeErr,
 	}
-
-	if d.isDataShort(data, 1) {
-		return nil, d.err
+	w := jsonbWalker{visitor: v, ignoreDecodeErr: e.ignoreJSONDecodeErr}
+	w.walkValue(data[0], data[1:])
+	if w.err != nil {
+		return nil, w.err
 	}
-
-	v := d.decodeValue(data[0], data[1:])
-	if d.err != nil {
-		return nil, d.err
+	if v.err != nil {
+		return nil, v.err
 	}
-
-	return json.Marshal(v)
+	return json.Marshal(v.root)
 }
 
-type jsonBinaryDecoder struct {
-	useDecimal               bool
-	useFloatWithTrailingZero bool
-	ignoreDecodeErr          bool
-	err                      error
+// jsonbWalker walks a JSONB byte stream and emits events to its visitor.
+// It owns all structural parsing (type-tag dispatch, offset tables,
+// inline-vs-pointer values, opaque-payload inner types) so visitors only
+// see semantic events.
+type jsonbWalker struct {
+	visitor         jsonbVisitor
+	ignoreDecodeErr bool
+	err             error
 }
 
-func (d *jsonBinaryDecoder) decodeValue(tp byte, data []byte) any {
-	if d.err != nil {
-		return nil
+func (w *jsonbWalker) walkValue(tp byte, data []byte) {
+	if w.err != nil {
+		return
 	}
 
 	switch tp {
 	case JSONB_SMALL_OBJECT:
-		return d.decodeObjectOrArray(data, true, true)
+		w.walkObjectOrArray(data, true, true)
 	case JSONB_LARGE_OBJECT:
-		return d.decodeObjectOrArray(data, false, true)
+		w.walkObjectOrArray(data, false, true)
 	case JSONB_SMALL_ARRAY:
-		return d.decodeObjectOrArray(data, true, false)
+		w.walkObjectOrArray(data, true, false)
 	case JSONB_LARGE_ARRAY:
-		return d.decodeObjectOrArray(data, false, false)
+		w.walkObjectOrArray(data, false, false)
 	case JSONB_LITERAL:
-		return d.decodeLiteral(data)
+		w.walkLiteral(data)
 	case JSONB_INT16:
-		return d.decodeInt16(data)
-	case JSONB_UINT16:
-		return d.decodeUint16(data)
-	case JSONB_INT32:
-		return d.decodeInt32(data)
-	case JSONB_UINT32:
-		return d.decodeUint32(data)
-	case JSONB_INT64:
-		return d.decodeInt64(data)
-	case JSONB_UINT64:
-		return d.decodeUint64(data)
-	case JSONB_DOUBLE:
-		if d.useFloatWithTrailingZero {
-			return d.decodeDoubleWithTrailingZero(data)
+		if !w.requireLen(data, 2) {
+			return
 		}
-		return d.decodeDouble(data)
+		w.visitor.Int(int64(mysql.ParseBinaryInt16(data[:2])))
+	case JSONB_UINT16:
+		if !w.requireLen(data, 2) {
+			return
+		}
+		w.visitor.Uint(uint64(mysql.ParseBinaryUint16(data[:2])))
+	case JSONB_INT32:
+		if !w.requireLen(data, 4) {
+			return
+		}
+		w.visitor.Int(int64(mysql.ParseBinaryInt32(data[:4])))
+	case JSONB_UINT32:
+		if !w.requireLen(data, 4) {
+			return
+		}
+		w.visitor.Uint(uint64(mysql.ParseBinaryUint32(data[:4])))
+	case JSONB_INT64:
+		if !w.requireLen(data, 8) {
+			return
+		}
+		w.visitor.Int(mysql.ParseBinaryInt64(data[:8]))
+	case JSONB_UINT64:
+		if !w.requireLen(data, 8) {
+			return
+		}
+		w.visitor.Uint(mysql.ParseBinaryUint64(data[:8]))
+	case JSONB_DOUBLE:
+		if !w.requireLen(data, 8) {
+			return
+		}
+		w.visitor.Double(mysql.ParseBinaryFloat64(data[:8]))
 	case JSONB_STRING:
-		return d.decodeString(data)
+		w.walkString(data)
 	case JSONB_OPAQUE:
-		return d.decodeOpaque(data)
+		w.walkOpaque(data)
 	default:
-		d.err = errors.Errorf("invalid json type %d", tp)
+		w.err = errors.Errorf("invalid json type %d", tp)
 	}
-
-	return nil
 }
 
-func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObject bool) any {
+func (w *jsonbWalker) walkLiteral(data []byte) {
+	if !w.requireLen(data, 1) {
+		return
+	}
+	switch data[0] {
+	case JSONB_NULL_LITERAL:
+		w.visitor.Null()
+	case JSONB_TRUE_LITERAL:
+		w.visitor.Bool(true)
+	case JSONB_FALSE_LITERAL:
+		w.visitor.Bool(false)
+	default:
+		w.err = errors.Errorf("invalid literal %c", data[0])
+	}
+}
+
+func (w *jsonbWalker) walkObjectOrArray(data []byte, isSmall, isObject bool) {
 	offsetSize := jsonbGetOffsetSize(isSmall)
-	if d.isDataShort(data, 2*offsetSize) {
-		return nil
+	if !w.requireLen(data, 2*offsetSize) {
+		return
 	}
 
-	count := d.decodeCount(data, isSmall)
-	size := d.decodeCount(data[offsetSize:], isSmall)
+	count := readJSONCount(data, isSmall)
+	size := readJSONCount(data[offsetSize:], isSmall)
 
-	if d.isDataShort(data, size) {
-		// Before MySQL 5.7.22, json type generated column may have invalid value,
-		// bug ref: https://bugs.mysql.com/bug.php?id=88791
-		// As generated column value is not used in replication, we can just ignore
-		// this error and return a dummy value for this column.
-		if d.ignoreDecodeErr {
-			d.err = nil
+	if len(data) < size {
+		// Before MySQL 5.7.22, json type generated column may have invalid
+		// value (bug ref: https://bugs.mysql.com/bug.php?id=88791). The
+		// generated column value is not used in replication, so we can
+		// emit null in its place when ignoreDecodeErr is set.
+		if w.ignoreDecodeErr {
+			w.visitor.Null()
+			return
 		}
-		return nil
+		w.err = errors.Errorf("data len %d < expected %d", len(data), size)
+		return
 	}
 
 	keyEntrySize := jsonbGetKeyEntrySize(isSmall)
 	valueEntrySize := jsonbGetValueEntrySize(isSmall)
-
 	headerSize := 2*offsetSize + count*valueEntrySize
-
 	if isObject {
 		headerSize += count * keyEntrySize
 	}
-
 	if headerSize > size {
-		d.err = errors.Errorf("header size %d > size %d", headerSize, size)
-		return nil
+		w.err = errors.Errorf("header size %d > size %d", headerSize, size)
+		return
 	}
 
-	var keys []string
+	var keys [][]byte
 	if isObject {
-		keys = make([]string, count)
-		for i := range count {
-			// decode key
+		keys = make([][]byte, count)
+		for i := 0; i < count; i++ {
 			entryOffset := 2*offsetSize + keyEntrySize*i
-			keyOffset := d.decodeCount(data[entryOffset:], isSmall)
-			keyLength := int(d.decodeUint16(data[entryOffset+offsetSize:]))
-
-			// Key must start after value entry
+			keyOffset := readJSONCount(data[entryOffset:], isSmall)
+			keyLength := int(mysql.ParseBinaryUint16(data[entryOffset+offsetSize : entryOffset+offsetSize+2]))
 			if keyOffset < headerSize {
-				d.err = errors.Errorf("invalid key offset %d, must > %d", keyOffset, headerSize)
-				return nil
+				w.err = errors.Errorf("invalid key offset %d, must >= %d", keyOffset, headerSize)
+				return
 			}
-
-			if d.isDataShort(data, keyOffset+keyLength) {
-				return nil
+			if !w.requireLen(data, keyOffset+keyLength) {
+				return
 			}
-
-			keys[i] = utils.ByteSliceToString(data[keyOffset : keyOffset+keyLength])
+			keys[i] = data[keyOffset : keyOffset+keyLength]
 		}
 	}
 
-	if d.err != nil {
-		return nil
+	if isObject {
+		w.visitor.BeginObject(count)
+	} else {
+		w.visitor.BeginArray(count)
 	}
 
-	values := make([]any, count)
-	for i := range count {
-		// decode value
+	for i := 0; i < count; i++ {
+		if i > 0 {
+			w.visitor.BeforeEntry()
+		}
+		if isObject {
+			w.visitor.Key(keys[i])
+		}
+
 		entryOffset := 2*offsetSize + valueEntrySize*i
 		if isObject {
 			entryOffset += keyEntrySize * count
 		}
-
 		tp := data[entryOffset]
-
 		if isInlineValue(tp, isSmall) {
-			values[i] = d.decodeValue(tp, data[entryOffset+1:entryOffset+valueEntrySize])
-			continue
+			w.walkValue(tp, data[entryOffset+1:entryOffset+valueEntrySize])
+		} else {
+			valueOffset := readJSONCount(data[entryOffset+1:], isSmall)
+			if !w.requireLen(data, valueOffset) {
+				return
+			}
+			w.walkValue(tp, data[valueOffset:])
 		}
-
-		valueOffset := d.decodeCount(data[entryOffset+1:], isSmall)
-
-		if d.isDataShort(data, valueOffset) {
-			return nil
+		if w.err != nil {
+			return
 		}
-
-		values[i] = d.decodeValue(tp, data[valueOffset:])
 	}
 
-	if d.err != nil {
-		return nil
+	if isObject {
+		w.visitor.EndObject()
+	} else {
+		w.visitor.EndArray()
 	}
-
-	if !isObject {
-		return values
-	}
-
-	m := make(map[string]any, count)
-	for i := range count {
-		m[keys[i]] = values[i]
-	}
-
-	return m
 }
 
 func isInlineValue(tp byte, isSmall bool) bool {
@@ -316,250 +361,87 @@ func isInlineValue(tp byte, isSmall bool) bool {
 	case JSONB_INT32, JSONB_UINT32:
 		return !isSmall
 	}
-
 	return false
 }
 
-func (d *jsonBinaryDecoder) decodeLiteral(data []byte) any {
-	if d.isDataShort(data, 1) {
-		return nil
+func (w *jsonbWalker) walkString(data []byte) {
+	l, n, err := readJSONVarLen(data)
+	if err != nil {
+		w.err = err
+		return
 	}
-
-	tp := data[0]
-
-	switch tp {
-	case JSONB_NULL_LITERAL:
-		return nil
-	case JSONB_TRUE_LITERAL:
-		return true
-	case JSONB_FALSE_LITERAL:
-		return false
+	if !w.requireLen(data, l+n) {
+		return
 	}
-
-	d.err = errors.Errorf("invalid literal %c", tp)
-
-	return nil
+	w.visitor.String(data[n : n+l])
 }
 
-func (d *jsonBinaryDecoder) isDataShort(data []byte, expected int) bool {
-	if d.err != nil {
-		return true
+func (w *jsonbWalker) walkOpaque(data []byte) {
+	if !w.requireLen(data, 1) {
+		return
 	}
-
-	if len(data) < expected {
-		d.err = errors.Errorf("data len %d < expected %d", len(data), expected)
-	}
-
-	return d.err != nil
-}
-
-func (d *jsonBinaryDecoder) decodeInt16(data []byte) int16 {
-	if d.isDataShort(data, 2) {
-		return 0
-	}
-
-	v := mysql.ParseBinaryInt16(data[0:2])
-	return v
-}
-
-func (d *jsonBinaryDecoder) decodeUint16(data []byte) uint16 {
-	if d.isDataShort(data, 2) {
-		return 0
-	}
-
-	v := mysql.ParseBinaryUint16(data[0:2])
-	return v
-}
-
-func (d *jsonBinaryDecoder) decodeInt32(data []byte) int32 {
-	if d.isDataShort(data, 4) {
-		return 0
-	}
-
-	v := mysql.ParseBinaryInt32(data[0:4])
-	return v
-}
-
-func (d *jsonBinaryDecoder) decodeUint32(data []byte) uint32 {
-	if d.isDataShort(data, 4) {
-		return 0
-	}
-
-	v := mysql.ParseBinaryUint32(data[0:4])
-	return v
-}
-
-func (d *jsonBinaryDecoder) decodeInt64(data []byte) int64 {
-	if d.isDataShort(data, 8) {
-		return 0
-	}
-
-	v := mysql.ParseBinaryInt64(data[0:8])
-	return v
-}
-
-func (d *jsonBinaryDecoder) decodeUint64(data []byte) uint64 {
-	if d.isDataShort(data, 8) {
-		return 0
-	}
-
-	v := mysql.ParseBinaryUint64(data[0:8])
-	return v
-}
-
-func (d *jsonBinaryDecoder) decodeDouble(data []byte) float64 {
-	if d.isDataShort(data, 8) {
-		return 0
-	}
-
-	v := mysql.ParseBinaryFloat64(data[0:8])
-	return v
-}
-
-func (d *jsonBinaryDecoder) decodeDoubleWithTrailingZero(data []byte) FloatWithTrailingZero {
-	v := d.decodeDouble(data)
-	return FloatWithTrailingZero(v)
-}
-
-func (d *jsonBinaryDecoder) decodeString(data []byte) string {
-	if d.err != nil {
-		return ""
-	}
-
-	l, n := d.decodeVariableLength(data)
-
-	if d.isDataShort(data, l+n) {
-		return ""
-	}
-
-	data = data[n:]
-
-	v := utils.ByteSliceToString(data[0:l])
-	return v
-}
-
-func (d *jsonBinaryDecoder) decodeOpaque(data []byte) any {
-	if d.isDataShort(data, 1) {
-		return nil
-	}
-
 	tp := data[0]
 	data = data[1:]
-
-	l, n := d.decodeVariableLength(data)
-
-	if d.isDataShort(data, l+n) {
-		return nil
+	l, n, err := readJSONVarLen(data)
+	if err != nil {
+		w.err = err
+		return
 	}
-
-	data = data[n : l+n]
-
+	if !w.requireLen(data, l+n) {
+		return
+	}
+	payload := data[n : n+l]
 	switch tp {
 	case mysql.MYSQL_TYPE_NEWDECIMAL:
-		return d.decodeDecimal(data)
+		if len(payload) < 2 {
+			w.err = errors.Errorf("decimal payload too short: %d", len(payload))
+			return
+		}
+		w.visitor.Decimal(int(payload[0]), int(payload[1]), payload[2:])
 	case mysql.MYSQL_TYPE_TIME:
-		return d.decodeTime(data)
-	case mysql.MYSQL_TYPE_DATE, mysql.MYSQL_TYPE_DATETIME, mysql.MYSQL_TYPE_TIMESTAMP:
-		return d.decodeDateTime(data)
+		w.visitor.Time(payload)
+	case mysql.MYSQL_TYPE_DATE:
+		w.visitor.Date(payload)
+	case mysql.MYSQL_TYPE_DATETIME, mysql.MYSQL_TYPE_TIMESTAMP:
+		w.visitor.DateTime(payload)
 	default:
-		return utils.ByteSliceToString(data)
+		w.visitor.OpaqueUnknown(tp, payload)
 	}
 }
 
-func (d *jsonBinaryDecoder) decodeDecimal(data []byte) any {
-	precision := int(data[0])
-	scale := int(data[1])
-
-	v, _, err := decodeDecimal(data[2:], precision, scale, d.useDecimal)
-	d.err = err
-
-	return v
+func (w *jsonbWalker) requireLen(data []byte, expected int) bool {
+	if len(data) < expected {
+		w.err = errors.Errorf("data len %d < expected %d", len(data), expected)
+		return false
+	}
+	return true
 }
 
-func (d *jsonBinaryDecoder) decodeTime(data []byte) any {
-	v := d.decodeInt64(data)
-
-	if v == 0 {
-		return "00:00:00"
-	}
-
-	sign := ""
-	if v < 0 {
-		sign = "-"
-		v = -v
-	}
-
-	intPart := v >> 24
-	hour := (intPart >> 12) % (1 << 10)
-	minute := (intPart >> 6) % (1 << 6)
-	sec := intPart % (1 << 6)
-	frac := v % (1 << 24)
-
-	return fmt.Sprintf("%s%02d:%02d:%02d.%06d", sign, hour, minute, sec, frac)
-}
-
-func (d *jsonBinaryDecoder) decodeDateTime(data []byte) any {
-	v := d.decodeInt64(data)
-	if v == 0 {
-		return "0000-00-00 00:00:00"
-	}
-
-	// handle negative?
-	if v < 0 {
-		v = -v
-	}
-
-	intPart := v >> 24
-	ymd := intPart >> 17
-	ym := ymd >> 5
-	hms := intPart % (1 << 17)
-
-	year := ym / 13
-	month := ym % 13
-	day := ymd % (1 << 5)
-	hour := hms >> 12
-	minute := (hms >> 6) % (1 << 6)
-	second := hms % (1 << 6)
-	frac := v % (1 << 24)
-
-	return fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d.%06d", year, month, day, hour, minute, second, frac)
-}
-
-func (d *jsonBinaryDecoder) decodeCount(data []byte, isSmall bool) int {
+func readJSONCount(data []byte, isSmall bool) int {
 	if isSmall {
-		v := d.decodeUint16(data)
-		return int(v)
+		return int(mysql.ParseBinaryUint16(data[:2]))
 	}
-
-	return int(d.decodeUint32(data))
+	return int(mysql.ParseBinaryUint32(data[:4]))
 }
 
-func (d *jsonBinaryDecoder) decodeVariableLength(data []byte) (int, int) {
-	// The max size for variable length is math.MaxUint32, so
-	// here we can use 5 bytes to save it.
-	maxCount := min(len(data), 5)
-
-	pos := 0
-	length := uint64(0)
-	for ; pos < maxCount; pos++ {
+// readJSONVarLen decodes the variable-length integer used by JSONB.
+func readJSONVarLen(data []byte) (length, consumed int, err error) {
+	maxCount := len(data)
+	if maxCount > 5 {
+		maxCount = 5
+	}
+	var l uint64
+	for pos := 0; pos < maxCount; pos++ {
 		v := data[pos]
-		length |= uint64(v&0x7F) << uint(7*pos)
-
+		l |= uint64(v&0x7F) << uint(7*pos)
 		if v&0x80 == 0 {
-			if length > math.MaxUint32 {
-				d.err = errors.Errorf("variable length %d must <= %d", length, int64(math.MaxUint32))
-				return 0, 0
+			if l > math.MaxUint32 {
+				return 0, 0, errors.Errorf("variable length %d exceeds %d", l, int64(math.MaxUint32))
 			}
-
-			pos++
-			// TODO: should consider length overflow int here.
-			return int(length), pos
+			return int(l), pos + 1, nil
 		}
 	}
-
-	d.err = errors.New("decode variable length failed")
-
-	return 0, 0
+	return 0, 0, errors.New("decode variable length failed")
 }
 
 func (e *RowsEvent) decodeJSONPartialBinary(data []byte) (*JsonDiff, error) {

@@ -165,30 +165,28 @@ func TestFloatWithTrailingZero_vs_RegularFloat64_Comparison(t *testing.T) {
 	}
 }
 
-func TestJsonBinaryDecoder_decodeDoubleWithTrailingZero(t *testing.T) {
-	// Test the decodeDoubleWithTrailingZero method directly
-	decoder := &jsonBinaryDecoder{
-		useFloatWithTrailingZero: true,
-	}
-
-	// Test data representing 5.0 as IEEE 754 double precision in little endian binary format
+func TestGoValueVisitor_Double_WithTrailingZero(t *testing.T) {
+	// Walk a single JSONB_DOUBLE scalar through the visitor with the
+	// trailing-zero flag set; the result tree should hold a
+	// FloatWithTrailingZero that marshals to "5.0" (not "5").
 	testData := make([]byte, 8)
 	binary.LittleEndian.PutUint64(testData, math.Float64bits(5.0))
 
-	result := decoder.decodeDoubleWithTrailingZero(testData)
-	require.NoError(t, decoder.err)
+	v := &goValueVisitor{useFloatWithTrailingZero: true}
+	w := jsonbWalker{visitor: v}
+	w.walkValue(JSONB_DOUBLE, testData)
+	require.NoError(t, w.err)
+	require.NoError(t, v.err)
 
-	// Verify the result is FloatWithTrailingZero type
-	require.IsType(t, FloatWithTrailingZero(0), result)
-	require.Equal(t, FloatWithTrailingZero(5.0), result)
+	require.IsType(t, FloatWithTrailingZero(0), v.root)
+	require.Equal(t, FloatWithTrailingZero(5.0), v.root)
 
-	// Test JSON marshaling
-	jsonBytes, err := json.Marshal(result)
+	jsonBytes, err := json.Marshal(v.root)
 	require.NoError(t, err)
 	require.Equal(t, "5.0", string(jsonBytes))
 }
 
-func TestJsonBinaryDecoder_decodeValue_JSONB_DOUBLE(t *testing.T) {
+func TestGoValueVisitor_JSONB_DOUBLE(t *testing.T) {
 	tests := []struct {
 		name                     string
 		useFloatWithTrailingZero bool
@@ -228,20 +226,17 @@ func TestJsonBinaryDecoder_decodeValue_JSONB_DOUBLE(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Test data as IEEE 754 double precision in little endian binary format
 			testData := make([]byte, 8)
 			binary.LittleEndian.PutUint64(testData, math.Float64bits(tt.value))
 
-			decoder := &jsonBinaryDecoder{
-				useFloatWithTrailingZero: tt.useFloatWithTrailingZero,
-			}
+			v := &goValueVisitor{useFloatWithTrailingZero: tt.useFloatWithTrailingZero}
+			w := jsonbWalker{visitor: v}
+			w.walkValue(JSONB_DOUBLE, testData)
+			require.NoError(t, w.err)
+			require.NoError(t, v.err)
+			require.IsType(t, tt.expectedType, v.root)
 
-			result := decoder.decodeValue(JSONB_DOUBLE, testData)
-			require.NoError(t, decoder.err)
-			require.IsType(t, tt.expectedType, result)
-
-			// Test JSON marshaling
-			jsonBytes, err := json.Marshal(result)
+			jsonBytes, err := json.Marshal(v.root)
 			require.NoError(t, err)
 			require.Equal(t, tt.expectedJSONString, string(jsonBytes))
 		})
@@ -374,15 +369,14 @@ func TestRowsEvent_UseFloatWithTrailingZero_Integration(t *testing.T) {
 	require.True(t, rowsWithTrailingZero.useFloatWithTrailingZero)
 	require.False(t, rowsWithoutTrailingZero.useFloatWithTrailingZero)
 
-	// Test the decoder creation with the setting
-	decoderWithTrailing := &jsonBinaryDecoder{
+	// Spot-check that the visitor honours the setting (the value tree
+	// produced by the walker is what json.Marshal sees).
+	visitorWithTrailing := &goValueVisitor{
 		useFloatWithTrailingZero: rowsWithTrailingZero.useFloatWithTrailingZero,
 	}
-
-	decoderWithoutTrailing := &jsonBinaryDecoder{
+	visitorWithoutTrailing := &goValueVisitor{
 		useFloatWithTrailingZero: rowsWithoutTrailingZero.useFloatWithTrailingZero,
 	}
-
-	require.True(t, decoderWithTrailing.useFloatWithTrailingZero)
-	require.False(t, decoderWithoutTrailing.useFloatWithTrailingZero)
+	require.True(t, visitorWithTrailing.useFloatWithTrailingZero)
+	require.False(t, visitorWithoutTrailing.useFloatWithTrailingZero)
 }
