@@ -685,6 +685,31 @@ func TestRenderJSONAsMySQLTextOpaqueTime(t *testing.T) {
 	require.Equal(t, `"10:30:45.123456"`, string(out))
 }
 
+// TestRenderJSONAsMySQLTextOpaqueZeroTemporals covers the zero values.
+// MySQL renders zero TIME/DATETIME/TIMESTAMP with the same 6-digit
+// fractional field as every other value; zero DATE stays fraction-free.
+func TestRenderJSONAsMySQLTextOpaqueZeroTemporals(t *testing.T) {
+	zero := make([]byte, 8)
+	cases := []struct {
+		name      string
+		want      string
+		innerType byte
+	}{
+		{"TIME", `"00:00:00.000000"`, mysql.MYSQL_TYPE_TIME},
+		{"DATETIME", `"0000-00-00 00:00:00.000000"`, mysql.MYSQL_TYPE_DATETIME},
+		{"TIMESTAMP", `"0000-00-00 00:00:00.000000"`, mysql.MYSQL_TYPE_TIMESTAMP},
+		{"DATE", `"0000-00-00"`, mysql.MYSQL_TYPE_DATE},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			data := append([]byte{JSONB_OPAQUE, c.innerType, 0x08}, zero...)
+			out, err := renderJSONAsMySQLText(data, false)
+			require.NoError(t, err)
+			require.Equal(t, c.want, string(out))
+		})
+	}
+}
+
 // TestRenderJSONAsMySQLTextIgnoreDecodeError verifies that with
 // ignoreDecodeErr=true the renderer returns a *valid* JSON document
 // ("null") rather than the half-written buffer it accumulated before
