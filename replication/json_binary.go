@@ -535,9 +535,10 @@ func (d *jsonBinaryDecoder) decodeDecimal(data []byte) any {
 func (d *jsonBinaryDecoder) decodeTime(data []byte) any {
 	v := d.decodeInt64(data)
 
-	if v == 0 {
-		return "00:00:00"
-	}
+	// v == 0 takes the general path below: MySQL renders zero TIME with
+	// the same 6-digit fractional field as every other value
+	// ("00:00:00.000000"), so a fraction-free zero shortcut would store
+	// a different string than the server's own render.
 
 	sign := ""
 	if v < 0 {
@@ -556,12 +557,11 @@ func (d *jsonBinaryDecoder) decodeTime(data []byte) any {
 
 func (d *jsonBinaryDecoder) decodeDateTime(data []byte, isDate bool) any {
 	v := d.decodeInt64(data)
-	if v == 0 {
-		if isDate {
-			return "0000-00-00"
-		}
-		return "0000-00-00 00:00:00"
-	}
+
+	// v == 0 takes the general path below: MySQL renders zero
+	// DATETIME/TIMESTAMP as "0000-00-00 00:00:00.000000" (6-digit
+	// fraction, like every other value) and zero DATE as "0000-00-00",
+	// which is exactly what the formatting below produces.
 
 	// handle negative?
 	if v < 0 {
