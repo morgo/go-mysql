@@ -3,12 +3,16 @@ package replication
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/test_util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,14 +42,16 @@ func TestFormatMySQLDouble(t *testing.T) {
 		{0.0, "0.0"},
 		{-3.0, "-3.0"},
 		{1e10, "10000000000.0"},
-		// Non-integer values: shortest round-trippable form. Note that
-		// Go's 'g' emits "1.5e-05" where MySQL's my_gcvt emits "1.5e-5";
-		// the float64 value (and therefore the re-stored JSONB) is
-		// identical, only the visible text differs.
+		// Non-integer values: shortest round-trip digits in MySQL's
+		// spelling. MySQL renders 1.5e-5 in fixed notation ("0.000015",
+		// not Go's "1.5e-05") -- byte identity with the server is the
+		// contract, see formatMySQLDouble.
 		{3.14, "3.14"},
 		{-2.5, "-2.5"},
 		{0.1, "0.1"},
-		{1.5e-5, "1.5e-05"},
+		{1.5e-5, "0.000015"},
+		// Signed zero survives.
+		{math.Copysign(0, -1), "-0.0"},
 	}
 	for _, c := range cases {
 		require.Equal(t, c.want, formatMySQLDouble(c.in), "in=%v", c.in)
@@ -54,6 +60,266 @@ func TestFormatMySQLDouble(t *testing.T) {
 	require.Equal(t, "null", formatMySQLDouble(math.NaN()))
 	require.Equal(t, "null", formatMySQLDouble(math.Inf(1)))
 	require.Equal(t, "null", formatMySQLDouble(math.Inf(-1)))
+}
+
+// mysqlDoubleParityVectors pins formatMySQLDouble's output to byte-exact
+// strings captured from MySQL 8.0.45 via
+//
+//	SELECT CAST(JSON_ARRAY(CAST('<strconv e-form>' AS DOUBLE)) AS CHAR)
+//
+// (CAST of a string to DOUBLE is correctly rounded, so this reproduces
+// the server's canonical rendering of exactly the given float64 while
+// bypassing MySQL's lossy rapidjson JSON text parser). The table
+// deliberately brackets every boundary of the derived selection rule:
+// the fixed-point window decpt in [-14, 15], the lone fixed cell at
+// decpt == 16 with 17 significant digits, both scientific regimes, and
+// the exponent spelling. TestFormatMySQLDoubleServerParity re-derives
+// this against a live server; this table keeps the contract enforced
+// without one.
+var mysqlDoubleParityVectors = []struct {
+	in   float64
+	want string
+}{
+	// Anchors.
+	{1, "1.0"},
+	{0.1, "0.1"},
+	{169.09, "169.09"},
+	{1.08822770526e+11, "108822770526.0"},
+	{9.007199254740992e+15, "9.007199254740992e15"}, // 2^53: decpt 16, nd 16 -> sci
+	{1e+16, "1e16"},
+	{1e-05, "0.00001"},
+	{1.5e-05, "0.000015"},
+	{5e-324, "5e-324"}, // smallest subnormal
+	{0.6000000000000001, "0.6000000000000001"},
+	{3.14, "3.14"},
+	{-2.5, "-2.5"},
+	// Upper fixed/sci boundary ladder.
+	{9.99999999999998e+14, "999999999999998.0"},
+	{9.99999999999999e+14, "999999999999999.0"},
+	{9.999999999999999e+14, "999999999999999.9"}, // decpt 15, nd 16 -> fixed
+	{1e+15, "1e15"}, // decpt 16, nd 1 -> sci
+	{1.000000000002048e+15, "1.000000000002048e15"},
+	{1.125899906842624e+15, "1.125899906842624e15"}, // 2^50
+	{4.503599627370496e+15, "4.503599627370496e15"}, // 2^52
+	{9.99e+15, "9.99e15"},
+	{1.5e+16, "1.5e16"},
+	{1.2345678901234568e+15, "1234567890123456.8"}, // decpt 16, nd 17 -> the lone fixed cell
+	{1.0000000000000001e+15, "1000000000000000.1"}, // decpt 16, nd 17 -> fixed
+	{9.999999999999998e+15, "9.999999999999998e15"},
+	{1.2345678901234568e+16, "1.2345678901234568e16"}, // decpt 17, nd 17 -> sci
+	{1.2345678901234567e+14, "123456789012345.67"},
+	{9.876543210987654e+16, "9.876543210987654e16"},
+	{1e+17, "1e17"},
+	{1e+18, "1e18"},
+	{1e+21, "1e21"},
+	{1e+25, "1e25"}, // start of the rapidjson re-parse corruption class
+	{1.2676506002282294e+30, "1.2676506002282294e30"}, // 2^100
+	{3.402823669209385e+38, "3.402823669209385e38"},   // 2^128
+	{1e+308, "1e308"},
+	{1.7976931348623157e+308, "1.7976931348623157e308"}, // DBL_MAX
+	{1.7976931348623155e+308, "1.7976931348623155e308"},
+	// Lower fixed/sci boundary ladder.
+	{0.001, "0.001"},
+	{0.000123, "0.000123"},
+	{0.0001, "0.0001"},
+	{1e-06, "0.000001"},
+	{1.5e-06, "0.0000015"},
+	{1e-07, "0.0000001"},
+	{1e-09, "0.000000001"},
+	{1e-13, "0.0000000000001"},
+	{1e-14, "0.00000000000001"},
+	{1e-15, "0.000000000000001"}, // decpt -14 -> still fixed
+	{1.5e-15, "0.0000000000000015"},
+	{1.2345678901234567e-14, "0.000000000000012345678901234567"},
+	{1e-16, "1e-16"}, // decpt -15 -> sci
+	{1.5e-16, "1.5e-16"},
+	{9.876543210987654e-15, "0.000000000000009876543210987654"},
+	{2.2250738585072014e-308, "2.2250738585072014e-308"}, // smallest normal
+	{1e-300, "1e-300"},
+	// Mid-range probes (the old formatter emitted Go-'g' forms such as
+	// "1.2345675e+06" for some of these).
+	{1.2345675e+06, "1234567.5"},
+	{1.0000005e+06, "1000000.5"},
+	{123456.789, "123456.789"},
+	{42, "42.0"},
+	{-42, "-42.0"},
+	{1e+10, "10000000000.0"},
+	{-1e+10, "-10000000000.0"},
+	{0.5, "0.5"},
+	{-0.5, "-0.5"},
+	{2.5, "2.5"},
+	{100, "100.0"},
+	{1e+14, "100000000000000.0"},
+	{9.9e+14, "990000000000000.0"},
+	{0.6, "0.6"},
+	{0.30000000000000004, "0.30000000000000004"},
+	{0.7071067811865476, "0.7071067811865476"},
+	{6.283185307179586, "6.283185307179586"},
+	{2.718281828459045, "2.718281828459045"},
+	{2.99792458e+08, "299792458.0"},
+	{9.80665, "9.80665"},
+	{6.62607015e-34, "6.62607015e-34"},
+	{6.02214076e+23, "6.02214076e23"},
+	// Negative mirrors across the boundaries (selection ignores sign).
+	{-9.007199254740992e+15, "-9.007199254740992e15"},
+	{-1.2345678901234568e+15, "-1234567890123456.8"},
+	{-1.2345678901234568e+16, "-1.2345678901234568e16"},
+	{-1e+15, "-1e15"},
+	{-1e+16, "-1e16"},
+	{-9.99999999999999e+14, "-999999999999999.0"},
+	{-1e-05, "-0.00001"},
+	{-1.5e-05, "-0.000015"},
+	{-1e-15, "-0.000000000000001"},
+	{-1e-16, "-1e-16"},
+	{-5e-324, "-5e-324"},
+	{-1e+308, "-1e308"},
+	{-1.7976931348623157e+308, "-1.7976931348623157e308"},
+	{-0.6000000000000001, "-0.6000000000000001"},
+	{-1e+25, "-1e25"},
+}
+
+// TestFormatMySQLDoublePinnedVectors enforces byte identity with MySQL
+// 8.0's JSON DOUBLE rendering against server-captured vectors, without
+// needing a live server. See mysqlDoubleParityVectors for provenance.
+func TestFormatMySQLDoublePinnedVectors(t *testing.T) {
+	for _, c := range mysqlDoubleParityVectors {
+		require.Equal(t, c.want, formatMySQLDouble(c.in),
+			"in=%v bits=%016x", c.in, math.Float64bits(c.in))
+		// Every rendering must also parse back to the identical bits:
+		// byte parity is worthless if it stopped being round-trippable.
+		back, err := strconv.ParseFloat(c.want, 64)
+		require.NoError(t, err)
+		require.Equal(t, math.Float64bits(c.in), math.Float64bits(back), "in=%v", c.in)
+	}
+}
+
+// serverParityCorpus builds a deterministic float64 corpus that hammers
+// the format-selection boundaries: every decimal point position p in
+// [-18, 18] crossed with 1/2/16/17 significant digits and several digit
+// patterns, both signs, plus the pinned vectors and a spread of
+// pseudo-random values (xorshift, fixed seed -- no math/rand, so the
+// corpus is identical on every run and Go version).
+func serverParityCorpus() []float64 {
+	seen := map[uint64]bool{}
+	var out []float64
+	add := func(f float64) {
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return
+		}
+		b := math.Float64bits(f)
+		if !seen[b] {
+			seen[b] = true
+			out = append(out, f)
+		}
+	}
+	for _, c := range mysqlDoubleParityVectors {
+		add(c.in)
+	}
+	add(0)
+	add(math.Copysign(0, -1))
+
+	state := uint64(0x9E3779B97F4A7C15)
+	next := func() uint64 {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		return state
+	}
+	randDigits := func(nd int) string {
+		b := make([]byte, nd)
+		b[0] = byte('1' + next()%9)
+		for i := 1; i < nd; i++ {
+			b[i] = byte('0' + next()%10)
+		}
+		if nd > 1 {
+			b[nd-1] = byte('1' + next()%9)
+		}
+		return string(b)
+	}
+	probe := func(digits string, p int) {
+		f, err := strconv.ParseFloat("0."+digits+"e"+strconv.Itoa(p), 64)
+		if err == nil {
+			add(f)
+			add(-f)
+		}
+	}
+	for p := -18; p <= 18; p++ {
+		for _, nd := range []int{1, 2, 16, 17} {
+			probe(strings.Repeat("9", nd), p)
+			if nd > 1 {
+				probe("1"+strings.Repeat("0", nd-2)+"1", p)
+			}
+			probe(randDigits(nd), p)
+		}
+	}
+	// Random spread across the full exponent range.
+	for i := 0; i < 300; i++ {
+		p := int(next()%640) - 320
+		probe(randDigits(1+int(next()%17)), p)
+	}
+	// Random bit patterns.
+	for i := 0; i < 300; i++ {
+		add(math.Float64frombits(next()))
+	}
+	return out
+}
+
+// TestFormatMySQLDoubleServerParity differentially tests
+// formatMySQLDouble against a live MySQL server: for every corpus value
+// it asks the server to render exactly that float64 as a JSON double
+// (string -> DOUBLE via correctly-rounded CAST, then JSON_ARRAY -> CHAR)
+// and requires byte identity. Follows the repo's live-server convention
+// (-host/-port flags, root user, empty password; set MYSQL_PASSWORD if
+// your server needs one) and skips when no server is reachable.
+func TestFormatMySQLDoubleServerParity(t *testing.T) {
+	c, err := client.Connect(
+		fmt.Sprintf("%s:%s", *test_util.MysqlHost, *test_util.MysqlPort),
+		"root", os.Getenv("MYSQL_PASSWORD"), "")
+	if err != nil {
+		t.Skip(err.Error())
+	}
+	defer c.Close()
+
+	res, err := c.Execute("SELECT VERSION()")
+	require.NoError(t, err)
+	version, err := res.GetString(0, 0)
+	require.NoError(t, err)
+	if strings.Contains(strings.ToLower(version), "mariadb") {
+		t.Skipf("parity contract targets MySQL, server is %q", version)
+	}
+
+	corpus := serverParityCorpus()
+	t.Logf("comparing %d doubles against %s", len(corpus), version)
+	const batch = 250
+	var mismatches int
+	for start := 0; start < len(corpus); start += batch {
+		end := min(start+batch, len(corpus))
+		var sb strings.Builder
+		for i := start; i < end; i++ {
+			if i > start {
+				sb.WriteString(" UNION ALL ")
+			}
+			// The 'e' -1 encoding parses back to exactly corpus[i].
+			fmt.Fprintf(&sb, "SELECT CAST(JSON_ARRAY(CAST('%s' AS DOUBLE)) AS CHAR)",
+				strconv.FormatFloat(corpus[i], 'e', -1, 64))
+		}
+		res, err := c.Execute(sb.String())
+		require.NoError(t, err)
+		require.Equal(t, end-start, res.RowNumber())
+		for i := start; i < end; i++ {
+			row, err := res.GetString(i-start, 0)
+			require.NoError(t, err)
+			want := strings.TrimSuffix(strings.TrimPrefix(row, "["), "]")
+			if got := formatMySQLDouble(corpus[i]); got != want {
+				mismatches++
+				if mismatches <= 10 {
+					t.Errorf("bits=%016x in=%v: server %q, formatMySQLDouble %q",
+						math.Float64bits(corpus[i]), corpus[i], want, got)
+				}
+			}
+		}
+	}
+	require.Zero(t, mismatches, "corpus size %d", len(corpus))
 }
 
 func TestWriteJSONString(t *testing.T) {

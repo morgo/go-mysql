@@ -16,10 +16,11 @@ import (
 // stays unquoted; etc.) and preserves the JSONB key order.
 //
 // Caveats:
-//   - The output is type-faithful, not byte-identical to MySQL's
-//     "SELECT json_col" form. Inter-token whitespace is compact (no
-//     space after ',' or ':') and floating-point text differs in some
-//     exponent/precision corner cases (see jsonMySQLDouble).
+//   - Inter-token whitespace is compact (no space after ',' or ':'),
+//     unlike MySQL's "SELECT json_col" form which puts a space after
+//     both. DOUBLE scalars are byte-identical to MySQL's own rendering
+//     (see jsonMySQLDouble / formatMySQLDouble for that contract);
+//     other leaves are type-faithful as described above.
 //   - NEWDECIMAL is the one tag that cannot be preserved on text
 //     round-trip: MySQL's JSON text grammar has no decimal literal, so
 //     re-inserting the unquoted number yields a JSON DOUBLE, not the
@@ -51,20 +52,19 @@ func (n jsonRawNumber) MarshalJSON() ([]byte, error) {
 	return []byte(n), nil
 }
 
-// jsonMySQLDouble formats a float64 close to the way MySQL does in JSON
-// text: whole-number doubles keep a trailing ".0" so MySQL re-stores
-// them as JSON DOUBLE rather than JSON INTEGER, and non-integer values
-// use the shortest round-trippable form. We can't reuse
-// FloatWithTrailingZero here because it formats non-integers with 'f'
-// (always plain decimal); MySQL uses scientific notation for some
-// magnitudes, which 'g' matches more closely.
-//
-// The output is NOT guaranteed to be byte-identical to MySQL's
-// my_gcvt-formatted text: Go's 'g' verb emits exponents as e.g.
-// "1.5e-05" where MySQL emits "1.5e-5", and the integer/scientific
-// crossover threshold differs. Binary round-trip through a MySQL JSON
-// column is unaffected (the same float64 produces the same JSONB
-// DOUBLE bytes); only the visible text form may differ.
+// jsonMySQLDouble formats a float64 exactly the way MySQL 8.0 renders a
+// JSON DOUBLE in JSON text. Byte-identity is the contract, not a
+// cosmetic nicety: consumers write this text back into MySQL JSON
+// columns, and MySQL's JSON text parser (rapidjson; see MySQL bugs
+// #116160 and #112904) misrounds long fixed-point expansions by 1-2 ulp
+// from roughly 1e25 upward. A formatter that spells such magnitudes in
+// fixed notation (e.g. 'f'-formatting 1e308 into a 309-digit expansion)
+// therefore corrupts the value when the text is re-inserted -- the
+// binary round-trip through a JSON column is NOT safe for that regime.
+// MySQL itself avoids the hazard by switching to scientific notation,
+// so matching its rendering byte-for-byte both preserves values and
+// keeps text-level checksums stable. See formatMySQLDouble for the
+// derived format-selection rule.
 type jsonMySQLDouble float64
 
 func (f jsonMySQLDouble) MarshalJSON() ([]byte, error) {
@@ -99,16 +99,86 @@ func (o jsonObject) MarshalJSON() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// formatMySQLDouble returns the exact byte sequence MySQL 8.0 emits for
+// a JSON DOUBLE scalar. The behaviour was derived empirically against
+// MySQL 8.0.45 (via SELECT CAST(JSON_ARRAY(CAST(<str> AS DOUBLE)) AS
+// CHAR), which bypasses the lossy rapidjson text parser) and validated
+// byte-for-byte over ~25k doubles covering every decimal-exponent /
+// digit-count combination near the format boundaries: 0 mismatches.
+//
+// The significant digits are always the shortest round-trip digit
+// string, which Go's strconv with precision -1 already produces
+// identically to MySQL's dtoa. Only the fixed-vs-scientific selection
+// and the exponent spelling differ from Go's defaults:
+//
+//   - With decpt = the decimal point position relative to the
+//     significant digits (f = 0.digits * 10^decpt) and nd = the number
+//     of significant digits, MySQL uses fixed-point notation iff
+//
+//     decpt >= -14 && (decpt <= 15 || nd > decpt)
+//
+//     i.e. fixed-point while the decimal point sits in [-14, 15], plus
+//     the one boundary case decpt == 16 && nd == 17 (a 17-significant-
+//     digit value that still has a digit after the decimal point, e.g.
+//     "1234567890123456.7"). nd <= 17 for every float64, so everything
+//     with decpt >= 17 or decpt <= -15 is scientific. The sign plays no
+//     part in the selection.
+//
+//   - Scientific notation spells the exponent without '+' and without
+//     zero padding: MySQL writes "9.007199254740992e15" and "1.5e-5"
+//     where Go's 'e'/'g' verbs write "9.007199254740992e+15" and
+//     "1.5e-05".
+//
+//   - The JSON layer appends ".0" when the result contains neither '.'
+//     nor 'e' (integral fixed-point values), so whole-number doubles
+//     re-parse as JSON DOUBLE rather than JSON INTEGER: 1e14 renders as
+//     "100000000000000.0" but 1e16 stays "1e16".
+//
+// NaN/Inf cannot be stored in MySQL JSON; they render as "null" rather
+// than corrupt the surrounding document.
 func formatMySQLDouble(f float64) string {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
-		// MySQL refuses to store NaN/Inf in JSON; emit a safe fallback
-		// rather than corrupt the surrounding document.
 		return "null"
 	}
-	if f == math.Trunc(f) {
-		return strconv.FormatFloat(f, 'f', 1, 64)
+	// The 'e' form carries both drivers of the format selection: the
+	// shortest round-trip digit string and the decimal exponent.
+	sci := strconv.AppendFloat(make([]byte, 0, 32), f, 'e', -1, 64)
+	ePos := bytes.IndexByte(sci, 'e')
+	exp, err := strconv.Atoi(string(sci[ePos+1:]))
+	if err != nil {
+		// Unreachable: 'e'-formatted output always ends in "e±NN".
+		return strconv.FormatFloat(f, 'g', -1, 64)
 	}
-	return strconv.FormatFloat(f, 'g', -1, 64)
+	mant := sci[:ePos] // "d" or "d.ddd", optionally '-'-prefixed
+	neg := mant[0] == '-'
+	if neg {
+		mant = mant[1:]
+	}
+	nd := len(mant)
+	if nd > 1 {
+		nd-- // drop the '.' at mant[1]
+	}
+	decpt := exp + 1 // f = 0.digits * 10^decpt
+
+	if decpt >= -14 && (decpt <= 15 || nd > decpt) {
+		// Fixed-point window. Longest possible form is 34 bytes
+		// (sign + "0." + 14 zeros + 17 digits).
+		out := strconv.AppendFloat(make([]byte, 0, 40), f, 'f', -1, 64)
+		if bytes.IndexByte(out, '.') < 0 {
+			out = append(out, '.', '0')
+		}
+		return string(out)
+	}
+
+	// Scientific notation: reuse Go's mantissa, respell the exponent.
+	out := make([]byte, 0, len(sci))
+	if neg {
+		out = append(out, '-')
+	}
+	out = append(out, mant...)
+	out = append(out, 'e')
+	out = strconv.AppendInt(out, int64(exp), 10)
+	return string(out)
 }
 
 // writeJSONString writes s as the contents of a JSON string (no
