@@ -51,6 +51,15 @@ func (c *Conn) HandleCommand() error {
 
 	data, err := c.ReadPacket()
 	if err != nil {
+		// A command over max_allowed_packet is answered the way MySQL answers
+		// it: send ER_NET_PACKET_TOO_LARGE, then close. The oversized payload
+		// was not drained, so the stream is desynced and the connection cannot
+		// carry another command regardless.
+		if e, ok := asPacketTooLarge(err); ok {
+			if writeErr := c.writeError(e); writeErr == nil {
+				_ = c.Flush()
+			}
+		}
 		c.Close()
 		c.Conn = nil
 		return err

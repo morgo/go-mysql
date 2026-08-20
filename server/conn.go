@@ -75,6 +75,10 @@ func (s *Server) NewCustomizedConn(conn net.Conn, authHandler AuthenticationHand
 	} else {
 		packetConn = packet.NewConn(conn)
 	}
+	// Set before handshake(): the handshake response is itself a client-supplied
+	// packet, so an unauthenticated peer would otherwise be able to make us
+	// buffer without bound before it has proved anything.
+	packetConn.SetMaxAllowedPacket(s.MaxAllowedPacket())
 
 	c := &Conn{
 		Conn:         packetConn,
@@ -116,6 +120,10 @@ func (c *Conn) handshake() error {
 			}
 			err = mysql.NewDefaultError(mysql.ER_ACCESS_DENIED_ERROR, c.user,
 				c.RemoteAddr().String(), mysql.MySQLErrName[usingPasswd])
+		} else if e, ok := asPacketTooLarge(err); ok {
+			// An oversized handshake response: report it the way MySQL does
+			// rather than as an unknown error.
+			err = e
 		}
 		c.authHandler.OnAuthFailure(c, err)
 		_ = c.writeError(err)
@@ -134,6 +142,17 @@ func (c *Conn) handshake() error {
 	c.ResetSequence()
 
 	return nil
+}
+
+// asPacketTooLarge maps a packet-layer size-limit failure to the protocol error
+// a real MySQL server reports before closing the connection. The second return
+// is false for every other error.
+func asPacketTooLarge(err error) (*mysql.MyError, bool) {
+	var tooLarge *packet.PacketTooLargeError
+	if !errors.As(err, &tooLarge) {
+		return nil, false
+	}
+	return mysql.NewDefaultError(mysql.ER_NET_PACKET_TOO_LARGE), true
 }
 
 func (c *Conn) Close() {

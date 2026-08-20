@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	goErrors "errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -26,7 +27,40 @@ const (
 	// DefaultReadBufferSize is the bufio.Reader size used by NewConn and
 	// EnableReadBuffering.
 	DefaultReadBufferSize = 64 * 1024
+	// DefaultMaxAllowedPacket mirrors the max_allowed_packet default of a
+	// MySQL 8.0 server (64MiB). A Conn enforces no limit until one is set, so
+	// this is only the value the server package defaults to.
+	DefaultMaxAllowedPacket = 64 << 20
 )
+
+// PacketTooLargeError reports a logical packet whose payload exceeded the
+// connection's MaxAllowedPacket. It is the transport-level counterpart of
+// MySQL's ER_NET_PACKET_TOO_LARGE.
+//
+// The offending payload is deliberately not drained: draining would spend our
+// bandwidth on data already refused, which is the cost the limit exists to
+// avoid. The stream is therefore left desynced and the connection cannot be
+// reused, so this error reports mysql.ErrBadConn as its cause — existing
+// callers discard the connection as they would on any other read failure.
+type PacketTooLargeError struct {
+	// Size is the payload accounted for when the limit tripped: the summed
+	// declared lengths of this packet's continuations up to and including the
+	// one that crossed the limit. The peer may have intended to send more.
+	Size int64
+	// Limit is the MaxAllowedPacket that was exceeded.
+	Limit int
+}
+
+func (e *PacketTooLargeError) Error() string {
+	return fmt.Sprintf("packet payload of %d bytes exceeds max allowed packet of %d bytes", e.Size, e.Limit)
+}
+
+// Cause and Unwrap both report mysql.ErrBadConn: the two spellings cover
+// pingcap/errors' Cause chain and the standard errors.Is/As chain, so callers
+// using either see a bad connection while still being able to errors.As their
+// way to this type for the ER_NET_PACKET_TOO_LARGE code.
+func (e *PacketTooLargeError) Cause() error  { return mysql.ErrBadConn }
+func (e *PacketTooLargeError) Unwrap() error { return mysql.ErrBadConn }
 
 // Conn is the base class to handle MySQL protocol.
 type Conn struct {
@@ -44,6 +78,10 @@ type Conn struct {
 	bw *bufio.Writer
 
 	copyNBuf []byte
+
+	// maxAllowedPacket bounds the reassembled payload of one logical packet;
+	// 0 means unlimited. See SetMaxAllowedPacket.
+	maxAllowedPacket int
 
 	header [4]byte
 
@@ -110,6 +148,29 @@ func (c *Conn) EnableReadBuffering(bufferSize int) {
 	}
 	c.br = bufio.NewReaderSize(c, bufferSize)
 	c.reader = c.br
+}
+
+// SetMaxAllowedPacket bounds the payload of a single logical packet that
+// ReadPacketTo will accept, the way MySQL's max_allowed_packet bounds an
+// inbound packet. A value of 0 (the default) means unlimited; negative values
+// are treated as 0.
+//
+// Servers should set this. Without a limit a peer can stream continuation
+// packets indefinitely and the reassembled payload is buffered in full, so the
+// memory a single connection consumes is whatever the peer decides to send.
+// Set it before the first read on the connection, so the handshake is covered
+// too; it is not safe to change once reads are in flight.
+func (c *Conn) SetMaxAllowedPacket(n int) {
+	if n < 0 {
+		n = 0
+	}
+	c.maxAllowedPacket = n
+}
+
+// MaxAllowedPacket returns the inbound payload limit for a single logical
+// packet, or 0 if reads are unlimited.
+func (c *Conn) MaxAllowedPacket() int {
+	return c.maxAllowedPacket
 }
 
 // connWriter adapts the deadline-setting write path to io.Writer so a
@@ -298,6 +359,15 @@ func (c *Conn) copyN(dst io.Writer, n int64) (int64, error) {
 	return written, nil
 }
 
+// ReadPacketTo reads one logical packet into w, reassembling the continuation
+// packets MySQL uses to carry payloads of MaxPayloadLen (16MiB) or more.
+//
+// When MaxAllowedPacket is set, the reassembled payload is bounded by it. The
+// check runs against each continuation's declared length before any of that
+// payload is read or the destination buffer is grown, so refusing an oversized
+// packet costs a 4-byte header rather than the bytes it claims to carry.
+// Continuations are consumed in a loop rather than by recursion, so a large
+// payload no longer costs a stack frame per 16MiB.
 func (c *Conn) ReadPacketTo(w io.Writer) error {
 	// The peer may be waiting on our buffered output before it sends more.
 	if err := c.Flush(); err != nil {
@@ -309,47 +379,57 @@ func (c *Conn) ReadPacketTo(w io.Writer) error {
 		utils.BytesBufferPut(b)
 	}()
 
-	// packets that come in a compressed packet may be partial
-	// so use the copyN function to read the packet header into a
-	// buffer, since copyN is capable of getting the next compressed
-	// packet and updating the Conn state with a new compressedReader.
-	if _, err := c.copyN(b, 4); err != nil {
-		return errors.Wrapf(mysql.ErrBadConn, "io.ReadFull(header) failed. err %v", err)
+	// Payload accumulated across this logical packet's continuations. int64
+	// because a payload assembled from many 16MiB continuations overflows int32
+	// and, on a 32-bit build, would wrap an int.
+	var payload int64
+
+	for {
+		// packets that come in a compressed packet may be partial
+		// so use the copyN function to read the packet header into a
+		// buffer, since copyN is capable of getting the next compressed
+		// packet and updating the Conn state with a new compressedReader.
+		b.Reset()
+		if _, err := c.copyN(b, 4); err != nil {
+			return errors.Wrapf(mysql.ErrBadConn, "io.ReadFull(header) failed. err %v", err)
+		}
+		// copy was successful so copy the 4 bytes from the buffer to the header
+		copy(c.header[:4], b.Bytes()[:4])
+
+		length := int(uint32(c.header[0]) | uint32(c.header[1])<<8 | uint32(c.header[2])<<16)
+		sequence := c.header[3]
+
+		if sequence != c.Sequence {
+			// A mismatched sequence leaves the stream desynced beyond recovery, so the
+			// connection is unusable: report it as bad, like the read failures above, so
+			// callers discard it instead of retrying on it.
+			return errors.Wrapf(mysql.ErrBadConn, "invalid sequence %d != %d", sequence, c.Sequence)
+		}
+
+		c.Sequence++
+
+		payload += int64(length)
+		if c.maxAllowedPacket > 0 && payload > int64(c.maxAllowedPacket) {
+			return &PacketTooLargeError{Size: payload, Limit: c.maxAllowedPacket}
+		}
+
+		if buf, ok := w.(*bytes.Buffer); ok {
+			// Allocate the buffer with expected length directly instead of call `grow` and migrate data many times.
+			buf.Grow(length)
+		}
+
+		if n, err := c.copyN(w, int64(length)); err != nil {
+			return errors.Wrapf(mysql.ErrBadConn, "io.CopyN failed. err %v, copied %v, expected %v", err, n, length)
+		} else if n != int64(length) {
+			return errors.Wrapf(mysql.ErrBadConn, "io.CopyN failed(n != int64(length)). %v bytes copied, while %v expected", n, length)
+		}
+
+		// Only a full-length packet is continued; anything shorter ends the
+		// logical packet.
+		if length < mysql.MaxPayloadLen {
+			return nil
+		}
 	}
-	// copy was successful so copy the 4 bytes from the buffer to the header
-	copy(c.header[:4], b.Bytes()[:4])
-
-	length := int(uint32(c.header[0]) | uint32(c.header[1])<<8 | uint32(c.header[2])<<16)
-	sequence := c.header[3]
-
-	if sequence != c.Sequence {
-		// A mismatched sequence leaves the stream desynced beyond recovery, so the
-		// connection is unusable: report it as bad, like the read failures above, so
-		// callers discard it instead of retrying on it.
-		return errors.Wrapf(mysql.ErrBadConn, "invalid sequence %d != %d", sequence, c.Sequence)
-	}
-
-	c.Sequence++
-
-	if buf, ok := w.(*bytes.Buffer); ok {
-		// Allocate the buffer with expected length directly instead of call `grow` and migrate data many times.
-		buf.Grow(length)
-	}
-
-	if n, err := c.copyN(w, int64(length)); err != nil {
-		return errors.Wrapf(mysql.ErrBadConn, "io.CopyN failed. err %v, copied %v, expected %v", err, n, length)
-	} else if n != int64(length) {
-		return errors.Wrapf(mysql.ErrBadConn, "io.CopyN failed(n != int64(length)). %v bytes copied, while %v expected", n, length)
-	}
-	if length < mysql.MaxPayloadLen {
-		return nil
-	}
-
-	if err := c.ReadPacketTo(w); err != nil {
-		return errors.Wrap(err, "ReadPacketTo failed")
-	}
-
-	return nil
 }
 
 // WritePacket data already has 4 bytes header will modify data in-place

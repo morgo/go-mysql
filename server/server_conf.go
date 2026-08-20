@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/packet"
 )
 
 // userConfigurableServerCapabilities lists handshake flags that may be toggled
@@ -44,6 +45,9 @@ type Server struct {
 	tlsConfig         *tls.Config
 	cacheShaPassword  *sync.Map // 'user@host' -> SHA256(SHA256(PASSWORD))
 	authProvider      AuthenticationProvider
+	// maxAllowedPacket bounds the payload of a single inbound packet, applied
+	// to every connection this server accepts. See SetMaxAllowedPacket.
+	maxAllowedPacket atomic.Int64
 }
 
 // NewDefaultServer: New mysql server with default settings.
@@ -53,12 +57,16 @@ type Server struct {
 // non-TLS connection). By default, it will verify the client certificate if present. You can enable TLS support on
 // the client side without providing a client-side certificate. So only when you need the server to verify client
 // identity for maximum security, you need to set a signed certificate for the client.
+//
+// Inbound packets are limited to packet.DefaultMaxAllowedPacket, matching a
+// MySQL 8.0 server's max_allowed_packet. Raise it with SetMaxAllowedPacket if
+// clients legitimately send larger payloads.
 func NewDefaultServer() *Server {
 	caPem, caKey := generateCA()
 	certPem, keyPem := generateAndSignRSACerts(caPem, caKey)
 	tlsConf := NewServerTLSConfig(caPem, certPem, keyPem, tls.VerifyClientCertIfGiven)
 	rsaPrivateKey, rsaPublicKeyBytes := getRSAKeyPairFromPEM(keyPem)
-	return &Server{
+	s := &Server{
 		serverVersion:   "8.0.11",
 		protocolVersion: 10,
 		capability: mysql.CLIENT_LONG_PASSWORD | mysql.CLIENT_LONG_FLAG | mysql.CLIENT_CONNECT_WITH_DB | mysql.CLIENT_PROTOCOL_41 |
@@ -73,6 +81,8 @@ func NewDefaultServer() *Server {
 		cacheShaPassword:  new(sync.Map),
 		authProvider:      &DefaultAuthenticationProvider{},
 	}
+	s.maxAllowedPacket.Store(packet.DefaultMaxAllowedPacket)
+	return s
 }
 
 // NewServer: New mysql server with customized settings.
@@ -115,7 +125,7 @@ func NewServerWithAuth(serverVersion string, collationID uint8, defaultAuthMetho
 	if tlsConfig != nil {
 		capFlag |= mysql.CLIENT_SSL
 	}
-	return &Server{
+	s := &Server{
 		serverVersion:     serverVersion,
 		protocolVersion:   10,
 		capability:        capFlag,
@@ -127,6 +137,8 @@ func NewServerWithAuth(serverVersion string, collationID uint8, defaultAuthMetho
 		cacheShaPassword:  new(sync.Map),
 		authProvider:      authProvider,
 	}
+	s.maxAllowedPacket.Store(packet.DefaultMaxAllowedPacket)
+	return s
 }
 
 func isAuthMethodSupported(authMethod string) bool {
@@ -172,6 +184,28 @@ func (s *Server) UnsetCapability(capability uint32) error {
 			break
 		}
 	}
+	return nil
+}
+
+// MaxAllowedPacket returns the inbound payload limit applied to connections
+// this server accepts, or 0 if reads are unlimited.
+func (s *Server) MaxAllowedPacket() int {
+	return int(s.maxAllowedPacket.Load())
+}
+
+// SetMaxAllowedPacket bounds the payload of a single inbound packet, the way
+// MySQL's max_allowed_packet does: a client that exceeds it gets
+// ER_NET_PACKET_TOO_LARGE and its connection is closed.
+//
+// A value of 0 disables the limit, which lets any authenticated — or, via the
+// handshake, unauthenticated — peer make the server buffer without bound.
+// Connections take the value in effect when they are accepted; changing it does
+// not affect connections already established.
+func (s *Server) SetMaxAllowedPacket(n int) error {
+	if n < 0 {
+		return fmt.Errorf("max allowed packet must not be negative, got %d", n)
+	}
+	s.maxAllowedPacket.Store(int64(n))
 	return nil
 }
 
