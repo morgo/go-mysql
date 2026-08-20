@@ -77,9 +77,7 @@ func serveOnce(t *testing.T, srv *Server, auth AuthenticationHandler) (addr stri
 // the payload it was promised.
 func TestHandshakeResponseOverMaxAllowedPacket(t *testing.T) {
 	srv := NewDefaultServer()
-	if err := srv.SetMaxAllowedPacket(1024); err != nil {
-		t.Fatalf("SetMaxAllowedPacket: %v", err)
-	}
+	srv.SetMaxAllowedPacket(1024)
 	addr, handshake := serveOnce(t, srv, NewInMemoryAuthenticationHandler())
 
 	conn, err := net.Dial("tcp", addr)
@@ -125,15 +123,13 @@ func TestServerDefaultsToMySQLMaxAllowedPacket(t *testing.T) {
 	}
 }
 
-// TestSetMaxAllowedPacketRejectsNegative keeps a caller from accidentally
-// configuring a limit that would reject every packet.
-func TestSetMaxAllowedPacketRejectsNegative(t *testing.T) {
+// TestSetMaxAllowedPacketOverridesDefault covers the one thing the setter has to
+// do: replace the default for connections accepted afterwards.
+func TestSetMaxAllowedPacketOverridesDefault(t *testing.T) {
 	srv := NewDefaultServer()
-	if err := srv.SetMaxAllowedPacket(-1); err == nil {
-		t.Error("SetMaxAllowedPacket(-1) = nil, want an error")
-	}
-	if got := srv.MaxAllowedPacket(); got != packet.DefaultMaxAllowedPacket {
-		t.Errorf("max allowed packet = %d after a rejected set, want it unchanged (%d)", got, packet.DefaultMaxAllowedPacket)
+	srv.SetMaxAllowedPacket(4 << 20)
+	if got := srv.MaxAllowedPacket(); got != 4<<20 {
+		t.Errorf("max allowed packet = %d, want %d", got, 4<<20)
 	}
 }
 
@@ -143,9 +139,7 @@ func TestSetMaxAllowedPacketRejectsNegative(t *testing.T) {
 // sent, so the server also has to refuse without waiting for the payload.
 func TestCommandOverMaxAllowedPacket(t *testing.T) {
 	srv := NewDefaultServer()
-	if err := srv.SetMaxAllowedPacket(1024); err != nil {
-		t.Fatalf("SetMaxAllowedPacket: %v", err)
-	}
+	srv.SetMaxAllowedPacket(1024)
 	auth := NewInMemoryAuthenticationHandler()
 	if err := auth.AddUser("packetuser", "packetpass"); err != nil {
 		t.Fatalf("AddUser: %v", err)

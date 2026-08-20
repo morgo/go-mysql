@@ -46,8 +46,9 @@ type Server struct {
 	cacheShaPassword  *sync.Map // 'user@host' -> SHA256(SHA256(PASSWORD))
 	authProvider      AuthenticationProvider
 	// maxAllowedPacket bounds the payload of a single inbound packet, applied
-	// to every connection this server accepts. See SetMaxAllowedPacket.
-	maxAllowedPacket atomic.Int64
+	// to every connection this server accepts. Setup-time only, so unlike
+	// capability it is read without synchronisation. See SetMaxAllowedPacket.
+	maxAllowedPacket int
 }
 
 // NewDefaultServer: New mysql server with default settings.
@@ -66,7 +67,7 @@ func NewDefaultServer() *Server {
 	certPem, keyPem := generateAndSignRSACerts(caPem, caKey)
 	tlsConf := NewServerTLSConfig(caPem, certPem, keyPem, tls.VerifyClientCertIfGiven)
 	rsaPrivateKey, rsaPublicKeyBytes := getRSAKeyPairFromPEM(keyPem)
-	s := &Server{
+	return &Server{
 		serverVersion:   "8.0.11",
 		protocolVersion: 10,
 		capability: mysql.CLIENT_LONG_PASSWORD | mysql.CLIENT_LONG_FLAG | mysql.CLIENT_CONNECT_WITH_DB | mysql.CLIENT_PROTOCOL_41 |
@@ -80,9 +81,8 @@ func NewDefaultServer() *Server {
 		tlsConfig:         tlsConf,
 		cacheShaPassword:  new(sync.Map),
 		authProvider:      &DefaultAuthenticationProvider{},
+		maxAllowedPacket:  packet.DefaultMaxAllowedPacket,
 	}
-	s.maxAllowedPacket.Store(packet.DefaultMaxAllowedPacket)
-	return s
 }
 
 // NewServer: New mysql server with customized settings.
@@ -125,7 +125,7 @@ func NewServerWithAuth(serverVersion string, collationID uint8, defaultAuthMetho
 	if tlsConfig != nil {
 		capFlag |= mysql.CLIENT_SSL
 	}
-	s := &Server{
+	return &Server{
 		serverVersion:     serverVersion,
 		protocolVersion:   10,
 		capability:        capFlag,
@@ -136,9 +136,8 @@ func NewServerWithAuth(serverVersion string, collationID uint8, defaultAuthMetho
 		tlsConfig:         tlsConfig,
 		cacheShaPassword:  new(sync.Map),
 		authProvider:      authProvider,
+		maxAllowedPacket:  packet.DefaultMaxAllowedPacket,
 	}
-	s.maxAllowedPacket.Store(packet.DefaultMaxAllowedPacket)
-	return s
 }
 
 func isAuthMethodSupported(authMethod string) bool {
@@ -190,23 +189,23 @@ func (s *Server) UnsetCapability(capability uint32) error {
 // MaxAllowedPacket returns the inbound payload limit applied to connections
 // this server accepts, or 0 if reads are unlimited.
 func (s *Server) MaxAllowedPacket() int {
-	return int(s.maxAllowedPacket.Load())
+	return s.maxAllowedPacket
 }
 
 // SetMaxAllowedPacket bounds the payload of a single inbound packet, the way
 // MySQL's max_allowed_packet does: a client that exceeds it gets
-// ER_NET_PACKET_TOO_LARGE and its connection is closed.
+// ER_NET_PACKET_TOO_LARGE and its connection is closed. It defaults to
+// packet.DefaultMaxAllowedPacket.
 //
-// A value of 0 disables the limit, which lets any authenticated — or, via the
-// handshake, unauthenticated — peer make the server buffer without bound.
-// Connections take the value in effect when they are accepted; changing it does
-// not affect connections already established.
-func (s *Server) SetMaxAllowedPacket(n int) error {
-	if n < 0 {
-		return fmt.Errorf("max allowed packet must not be negative, got %d", n)
-	}
-	s.maxAllowedPacket.Store(int64(n))
-	return nil
+// Call this during setup, before the server accepts anything. The value is
+// stored without synchronisation and is read on every accept, so changing it on
+// a serving server races with connections being established.
+//
+// A value of 0 or less disables the limit, which lets any peer — including an
+// unauthenticated one, since the handshake response is read the same way — make
+// the server buffer without bound.
+func (s *Server) SetMaxAllowedPacket(n int) {
+	s.maxAllowedPacket = n
 }
 
 func validateUserConfigurableCapability(capability uint32) error {
