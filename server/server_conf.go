@@ -45,10 +45,7 @@ type Server struct {
 	tlsConfig         *tls.Config
 	cacheShaPassword  *sync.Map // 'user@host' -> SHA256(SHA256(PASSWORD))
 	authProvider      AuthenticationProvider
-	// maxAllowedPacket bounds the payload of a single inbound packet, applied
-	// to every connection this server accepts. Setup-time only, so unlike
-	// capability it is read without synchronisation. See SetMaxAllowedPacket.
-	maxAllowedPacket int
+	maxAllowedPacket  int
 }
 
 // NewDefaultServer: New mysql server with default settings.
@@ -194,16 +191,11 @@ func (s *Server) MaxAllowedPacket() int {
 
 // SetMaxAllowedPacket bounds the payload of a single inbound packet, the way
 // MySQL's max_allowed_packet does: a client that exceeds it gets
-// ER_NET_PACKET_TOO_LARGE and its connection is closed. It defaults to
-// packet.DefaultMaxAllowedPacket.
+// ER_NET_PACKET_TOO_LARGE and its connection is closed.
 //
-// Call this during setup, before the server accepts anything. The value is
-// stored without synchronisation and is read on every accept, so changing it on
-// a serving server races with connections being established.
-//
-// A value of 0 or less disables the limit, which lets any peer — including an
-// unauthenticated one, since the handshake response is read the same way — make
-// the server buffer without bound.
+// Call it during setup — the value is read on every accept and stored without
+// synchronisation. 0 or less disables the limit, which lets any peer, including
+// an unauthenticated one, make the server buffer without bound.
 func (s *Server) SetMaxAllowedPacket(n int) {
 	s.maxAllowedPacket = n
 }

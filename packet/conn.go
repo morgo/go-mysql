@@ -79,9 +79,10 @@ type Conn struct {
 
 	copyNBuf []byte
 
-	// maxAllowedPacket bounds the reassembled payload of one logical packet;
-	// 0 means unlimited. See SetMaxAllowedPacket.
-	maxAllowedPacket int
+	// MaxAllowedPacket bounds the reassembled payload of one logical packet, the
+	// way MySQL's max_allowed_packet bounds an inbound packet; 0 or less means
+	// unlimited. Set it before the first read, so the handshake is covered too.
+	MaxAllowedPacket int
 
 	header [4]byte
 
@@ -148,29 +149,6 @@ func (c *Conn) EnableReadBuffering(bufferSize int) {
 	}
 	c.br = bufio.NewReaderSize(c, bufferSize)
 	c.reader = c.br
-}
-
-// SetMaxAllowedPacket bounds the payload of a single logical packet that
-// ReadPacketTo will accept, the way MySQL's max_allowed_packet bounds an
-// inbound packet. A value of 0 (the default) means unlimited; negative values
-// are treated as 0.
-//
-// Servers should set this. Without a limit a peer can stream continuation
-// packets indefinitely and the reassembled payload is buffered in full, so the
-// memory a single connection consumes is whatever the peer decides to send.
-// Set it before the first read on the connection, so the handshake is covered
-// too; it is not safe to change once reads are in flight.
-func (c *Conn) SetMaxAllowedPacket(n int) {
-	if n < 0 {
-		n = 0
-	}
-	c.maxAllowedPacket = n
-}
-
-// MaxAllowedPacket returns the inbound payload limit for a single logical
-// packet, or 0 if reads are unlimited.
-func (c *Conn) MaxAllowedPacket() int {
-	return c.maxAllowedPacket
 }
 
 // connWriter adapts the deadline-setting write path to io.Writer so a
@@ -363,11 +341,9 @@ func (c *Conn) copyN(dst io.Writer, n int64) (int64, error) {
 // packets MySQL uses to carry payloads of MaxPayloadLen (16MiB) or more.
 //
 // When MaxAllowedPacket is set, the reassembled payload is bounded by it. The
-// check runs against each continuation's declared length before any of that
-// payload is read or the destination buffer is grown, so refusing an oversized
-// packet costs a 4-byte header rather than the bytes it claims to carry.
-// Continuations are consumed in a loop rather than by recursion, so a large
-// payload no longer costs a stack frame per 16MiB.
+// check runs on each continuation's declared length before that payload is read
+// or the destination buffer is grown for it, so refusing an oversized packet
+// costs a 4-byte header rather than the bytes it claims to carry.
 func (c *Conn) ReadPacketTo(w io.Writer) error {
 	// The peer may be waiting on our buffered output before it sends more.
 	if err := c.Flush(); err != nil {
@@ -409,8 +385,8 @@ func (c *Conn) ReadPacketTo(w io.Writer) error {
 		c.Sequence++
 
 		payload += int64(length)
-		if c.maxAllowedPacket > 0 && payload > int64(c.maxAllowedPacket) {
-			return &PacketTooLargeError{Size: payload, Limit: c.maxAllowedPacket}
+		if c.MaxAllowedPacket > 0 && payload > int64(c.MaxAllowedPacket) {
+			return &PacketTooLargeError{Size: payload, Limit: c.MaxAllowedPacket}
 		}
 
 		if buf, ok := w.(*bytes.Buffer); ok {

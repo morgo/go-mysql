@@ -318,7 +318,7 @@ func fullLengthPacketPlus(tail []byte) []byte {
 func TestReadPacketRefusesOversizedPacketWithoutReadingIt(t *testing.T) {
 	const payloadLen = 4096
 	c, r := newReadTestConnReader(mysqlPacket(0, bytes.Repeat([]byte("x"), payloadLen)), mysql.MYSQL_COMPRESS_NONE)
-	c.SetMaxAllowedPacket(64)
+	c.MaxAllowedPacket = 64
 
 	_, err := c.ReadPacket()
 	var tooLarge *PacketTooLargeError
@@ -347,7 +347,7 @@ func TestReadPacketRefusesOversizedContinuation(t *testing.T) {
 
 	c, r := newReadTestConnReader(stream, mysql.MYSQL_COMPRESS_NONE)
 	// The first packet fits on its own; the pair does not.
-	c.SetMaxAllowedPacket(mysql.MaxPayloadLen + 128)
+	c.MaxAllowedPacket = mysql.MaxPayloadLen + 128
 
 	_, err := c.ReadPacket()
 	var tooLarge *PacketTooLargeError
@@ -368,7 +368,7 @@ func TestReadPacketRefusesOversizedContinuation(t *testing.T) {
 func TestReadPacketMultiPacketPayloadWithinLimit(t *testing.T) {
 	tail := []byte("tail")
 	c := newReadTestConn(fullLengthPacketPlus(tail), mysql.MYSQL_COMPRESS_NONE)
-	c.SetMaxAllowedPacket(mysql.MaxPayloadLen + len(tail))
+	c.MaxAllowedPacket = mysql.MaxPayloadLen + len(tail)
 
 	got, err := c.ReadPacket()
 	if err != nil {
@@ -390,8 +390,8 @@ func TestReadPacketMultiPacketPayloadWithinLimit(t *testing.T) {
 func TestReadPacketUnlimitedByDefault(t *testing.T) {
 	payload := bytes.Repeat([]byte("z"), 4096)
 	c := newReadTestConn(mysqlPacket(0, payload), mysql.MYSQL_COMPRESS_NONE)
-	if c.MaxAllowedPacket() != 0 {
-		t.Fatalf("MaxAllowedPacket = %d, want 0 (unlimited)", c.MaxAllowedPacket())
+	if c.MaxAllowedPacket != 0 {
+		t.Fatalf("MaxAllowedPacket = %d, want 0 (unlimited)", c.MaxAllowedPacket)
 	}
 
 	got, err := c.ReadPacket()
@@ -411,7 +411,7 @@ func TestReadPacketUnlimitedByDefault(t *testing.T) {
 // sits between the caller and this error.
 func TestPacketTooLargeErrorIsBadConn(t *testing.T) {
 	c := newReadTestConn(mysqlPacket(0, bytes.Repeat([]byte("x"), 512)), mysql.MYSQL_COMPRESS_NONE)
-	c.SetMaxAllowedPacket(16)
+	c.MaxAllowedPacket = 16
 
 	_, err := c.ReadPacket()
 	if err == nil {
@@ -422,16 +422,5 @@ func TestPacketTooLargeErrorIsBadConn(t *testing.T) {
 	}
 	if !goErrors.Is(err, mysql.ErrBadConn) {
 		t.Errorf("errors.Is(err, ErrBadConn) = false for %v, want true", err)
-	}
-}
-
-// TestSetMaxAllowedPacketNegativeMeansUnlimited documents the clamp, so a
-// caller computing a limit that goes negative gets the documented behaviour
-// rather than a limit that rejects every packet.
-func TestSetMaxAllowedPacketNegativeMeansUnlimited(t *testing.T) {
-	c := newReadTestConn(nil, mysql.MYSQL_COMPRESS_NONE)
-	c.SetMaxAllowedPacket(-1)
-	if c.MaxAllowedPacket() != 0 {
-		t.Errorf("MaxAllowedPacket = %d, want 0", c.MaxAllowedPacket())
 	}
 }
