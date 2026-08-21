@@ -75,9 +75,8 @@ func (s *Server) NewCustomizedConn(conn net.Conn, authHandler AuthenticationHand
 	} else {
 		packetConn = packet.NewConn(conn)
 	}
-	// Set before handshake(): the handshake response is itself a client-supplied
-	// packet, so an unauthenticated peer would otherwise be able to make us
-	// buffer without bound before it has proved anything.
+	// Before handshake(): the handshake response is client-supplied too, and read
+	// before the peer has proved anything.
 	packetConn.MaxAllowedPacket = s.MaxAllowedPacket
 
 	c := &Conn{
@@ -121,8 +120,7 @@ func (c *Conn) handshake() error {
 			err = mysql.NewDefaultError(mysql.ER_ACCESS_DENIED_ERROR, c.user,
 				c.RemoteAddr().String(), mysql.MySQLErrName[usingPasswd])
 		} else if errors.Is(err, packet.ErrPacketTooLarge) {
-			// An oversized handshake response: report it the way MySQL does
-			// rather than as an unknown error.
+			// Report an oversized handshake response the way MySQL does.
 			err = mysql.NewDefaultError(mysql.ER_NET_PACKET_TOO_LARGE)
 		}
 		c.authHandler.OnAuthFailure(c, err)

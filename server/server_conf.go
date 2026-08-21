@@ -46,14 +46,10 @@ type Server struct {
 	cacheShaPassword  *sync.Map // 'user@host' -> SHA256(SHA256(PASSWORD))
 	authProvider      AuthenticationProvider
 
-	// MaxAllowedPacket bounds the payload of a single inbound packet, the way
-	// MySQL's max_allowed_packet does: a client that exceeds it gets
-	// ER_NET_PACKET_TOO_LARGE and its connection is closed. It defaults to
-	// packet.DefaultMaxAllowedPacket.
-	//
-	// Assign it during setup. It is read on every accept without
-	// synchronisation, and 0 or less disables the limit, which lets any peer,
-	// including an unauthenticated one, make the server buffer without bound.
+	// MaxAllowedPacket bounds the payload of a single inbound packet, as MySQL's
+	// max_allowed_packet does: a client over it gets ER_NET_PACKET_TOO_LARGE and
+	// is disconnected. Assign it during setup; it is read on every accept without
+	// synchronisation, and 0 or less means unlimited.
 	MaxAllowedPacket int
 }
 
@@ -65,9 +61,8 @@ type Server struct {
 // the client side without providing a client-side certificate. So only when you need the server to verify client
 // identity for maximum security, you need to set a signed certificate for the client.
 //
-// Inbound packets are limited to packet.DefaultMaxAllowedPacket, matching a
-// MySQL 8.0 server's max_allowed_packet. Raise MaxAllowedPacket if clients
-// legitimately send larger payloads.
+// Inbound packets are limited to packet.DefaultMaxAllowedPacket; raise
+// MaxAllowedPacket if clients legitimately send larger payloads.
 func NewDefaultServer() *Server {
 	caPem, caKey := generateCA()
 	certPem, keyPem := generateAndSignRSACerts(caPem, caKey)

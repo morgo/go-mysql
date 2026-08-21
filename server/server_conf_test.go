@@ -220,9 +220,8 @@ func TestSetCapabilityRejectsUnsafeFlags(t *testing.T) {
 	require.False(t, svr.Capability()&mysql.CLIENT_LOCAL_FILES != 0)
 }
 
-// readRawPacket reads one MySQL protocol packet (4-byte header + payload) off
-// the wire. These tests speak the protocol directly rather than through a
-// client, because the point is to send something no client would send.
+// readRawPacket reads one packet (4-byte header + payload) off the wire. These
+// tests speak the protocol directly, to send what no client would send.
 func readRawPacket(conn net.Conn) (seq byte, payload []byte, err error) {
 	var hdr [4]byte
 	if _, err = io.ReadFull(conn, hdr[:]); err != nil {
@@ -245,8 +244,7 @@ func errPacketCode(t *testing.T, payload []byte) uint16 {
 }
 
 // serveOnce accepts one connection and runs the server side of it. The channel
-// carries the handshake error, or — when the handshake succeeds — the result of
-// serving one command.
+// carries the handshake error, or the result of serving one command.
 func serveOnce(t *testing.T, srv *Server, auth AuthenticationHandler) (addr string, served <-chan error) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -271,12 +269,9 @@ func serveOnce(t *testing.T, srv *Server, auth AuthenticationHandler) (addr stri
 	return ln.Addr().String(), result
 }
 
-// TestHandshakeResponseOverMaxAllowedPacket covers the pre-auth exposure. The
-// handshake response is a client-supplied packet read before any credential is
-// checked, so an unlimited server lets an unauthenticated peer decide how much
-// memory it buffers. Only the 4-byte header is sent here: the server must refuse
-// on the declared length alone, without waiting for — or reserving room for —
-// the payload it was promised.
+// TestHandshakeResponseOverMaxAllowedPacket covers the pre-auth exposure: the
+// handshake response is read before any credential is checked. Only the header
+// is sent, so the server must refuse on the declared length alone.
 func TestHandshakeResponseOverMaxAllowedPacket(t *testing.T) {
 	srv := NewDefaultServer()
 	srv.MaxAllowedPacket = 1024
@@ -300,19 +295,17 @@ func TestHandshakeResponseOverMaxAllowedPacket(t *testing.T) {
 	require.Error(t, <-handshake, "NewCustomizedConn should reject an oversized handshake response")
 }
 
-// TestServerDefaultsToMySQLMaxAllowedPacket pins the default a server starts
-// with: unlimited reads are the vulnerable configuration, so the constructors
-// must not leave the limit at zero.
+// TestServerDefaultsToMySQLMaxAllowedPacket pins the default: unlimited is the
+// vulnerable configuration, so no constructor may leave the limit at zero.
 func TestServerDefaultsToMySQLMaxAllowedPacket(t *testing.T) {
 	require.Equal(t, packet.DefaultMaxAllowedPacket, NewDefaultServer().MaxAllowedPacket)
 	srv := NewServer("8.0.11", mysql.DEFAULT_COLLATION_ID, mysql.AUTH_NATIVE_PASSWORD, nil, nil)
 	require.Equal(t, packet.DefaultMaxAllowedPacket, srv.MaxAllowedPacket)
 }
 
-// TestCommandOverMaxAllowedPacket covers the command phase, which is where a
-// proxy spends its life: an authenticated client's oversized command must be
-// answered with ER_NET_PACKET_TOO_LARGE, not merely dropped. Only the header is
-// sent, so the server also has to refuse without waiting for the payload.
+// TestCommandOverMaxAllowedPacket covers the command phase, where a proxy spends
+// its life: an oversized command must be answered with ER_NET_PACKET_TOO_LARGE,
+// not merely dropped.
 func TestCommandOverMaxAllowedPacket(t *testing.T) {
 	srv := NewDefaultServer()
 	srv.MaxAllowedPacket = 1024
@@ -323,14 +316,12 @@ func TestCommandOverMaxAllowedPacket(t *testing.T) {
 	c, err := client.Connect(addr, "packetuser", "packetpass", "")
 	require.NoError(t, err)
 	defer c.Close()
-	// A server that failed to refuse would block reading the payload the header
-	// promised, so bound the read: the failure mode should be a failing test,
-	// not a hanging one.
+	// A server that failed to refuse would block on the promised payload; bound
+	// the read so that fails the test rather than hanging it.
 	require.NoError(t, c.Conn.Conn.SetDeadline(time.Now().Add(10*time.Second)))
 
-	// A command declaring a 4MiB payload, sequence 0. Written under the client's
-	// packet layer so no payload follows; the client's sequence is advanced by
-	// hand to match what the server will reply with.
+	// A command declaring a 4MiB payload, sequence 0, written under the client's
+	// packet layer so none follows. Its sequence is advanced by hand to match.
 	_, err = c.Conn.Conn.Write([]byte{0x00, 0x00, 0x40, 0x00})
 	require.NoError(t, err, "writing oversized command header")
 	c.Sequence = 1

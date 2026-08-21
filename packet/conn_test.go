@@ -21,8 +21,8 @@ func newReadTestConn(stream []byte, compression uint8) *Conn {
 	return c
 }
 
-// newReadTestConnReader is newReadTestConn with the underlying reader exposed,
-// so a test can assert how much of the stream was actually consumed.
+// newReadTestConnReader also returns the reader, so a test can assert how much
+// of the stream was consumed.
 func newReadTestConnReader(stream []byte, compression uint8) (*Conn, *bytes.Reader) {
 	r := bytes.NewReader(stream)
 	c := new(Conn)
@@ -299,10 +299,8 @@ func TestReadPacketSequenceMismatchIsBadConn(t *testing.T) {
 	}
 }
 
-// fullLengthPacketPlus builds the wire bytes for one logical packet whose
-// payload is MaxPayloadLen bytes followed by tail: a full-length packet plus the
-// shorter continuation that terminates it. This is the only shape that exercises
-// reassembly, since only a packet of exactly MaxPayloadLen is continued.
+// fullLengthPacketPlus builds a MaxPayloadLen packet plus the shorter
+// continuation that terminates it: the only shape that exercises reassembly.
 func fullLengthPacketPlus(tail []byte) []byte {
 	stream := make([]byte, 0, 4+mysql.MaxPayloadLen+4+len(tail))
 	stream = append(stream, 0xff, 0xff, 0xff, 0) // MaxPayloadLen, sequence 0
@@ -312,10 +310,8 @@ func fullLengthPacketPlus(tail []byte) []byte {
 }
 
 // TestReadPacketRefusesOversizedPacketWithoutReadingIt pins the ordering that
-// makes the limit worth having: the declared length is checked before any of the
-// payload is read and before the destination buffer is grown to hold it, so
-// refusing a packet costs its 4-byte header and nothing else. A limit enforced
-// after reassembly would still let a peer decide how much we allocate.
+// makes the limit worth having: checked before the payload is read or the buffer
+// grown, so refusing costs a header. Enforced after reassembly it would not.
 func TestReadPacketRefusesOversizedPacketWithoutReadingIt(t *testing.T) {
 	const payloadLen = 4096
 	c, r := newReadTestConnReader(mysqlPacket(0, bytes.Repeat([]byte("x"), payloadLen)), mysql.MYSQL_COMPRESS_NONE)
@@ -327,11 +323,9 @@ func TestReadPacketRefusesOversizedPacketWithoutReadingIt(t *testing.T) {
 	require.Equal(t, payloadLen, r.Len(), "payload bytes were consumed; want the payload left unread")
 }
 
-// TestReadPacketRefusesOversizedContinuation covers the case the per-packet
-// header cannot catch on its own: every continuation is individually legal (the
-// 3-byte length field cannot express more than MaxPayloadLen), so only their sum
-// bounds the payload. Streaming continuations is exactly how a peer makes a
-// server buffer without bound.
+// TestReadPacketRefusesOversizedContinuation covers what a per-packet check
+// cannot catch: each continuation is legal on its own, since a 3-byte length
+// cannot exceed MaxPayloadLen, so only their sum bounds the payload.
 func TestReadPacketRefusesOversizedContinuation(t *testing.T) {
 	const tailLen = 512
 	stream := fullLengthPacketPlus(bytes.Repeat([]byte("b"), tailLen))
@@ -342,14 +336,12 @@ func TestReadPacketRefusesOversizedContinuation(t *testing.T) {
 
 	_, err := c.ReadPacket()
 	require.ErrorIs(t, err, ErrPacketTooLarge)
-	// Neither continuation is oversized on its own; only their sum is.
 	require.ErrorContains(t, err, fmt.Sprintf("%d bytes declared", mysql.MaxPayloadLen+tailLen))
 	require.Equal(t, tailLen, r.Len(), "continuation payload bytes were consumed; want them left unread")
 }
 
 // TestReadPacketMultiPacketPayloadWithinLimit guards the loop rewrite: a payload
-// spanning a continuation still reassembles, and a payload of exactly
-// MaxAllowedPacket is accepted (the limit is a maximum, not a strict bound).
+// spanning a continuation reassembles, and exactly MaxAllowedPacket is accepted.
 func TestReadPacketMultiPacketPayloadWithinLimit(t *testing.T) {
 	tail := []byte("tail")
 	c := newReadTestConn(fullLengthPacketPlus(tail), mysql.MYSQL_COMPRESS_NONE)
@@ -357,14 +349,13 @@ func TestReadPacketMultiPacketPayloadWithinLimit(t *testing.T) {
 
 	got, err := c.ReadPacket()
 	require.NoError(t, err)
-	// Lengths rather than require.Len, so a failure does not dump 16MiB.
+	// Lengths, not require.Len, so a failure does not dump 16MiB.
 	require.Equal(t, mysql.MaxPayloadLen+len(tail), len(got))
 	require.Equal(t, tail, got[mysql.MaxPayloadLen:], "continuation payload")
 	require.Equal(t, uint8(2), c.Sequence, "both packets should be accounted for")
 }
 
-// TestReadPacketUnlimitedByDefault keeps the limit opt-in at the packet layer, so
-// introducing it does not change what an existing Conn accepts.
+// TestReadPacketUnlimitedByDefault keeps the limit opt-in at the packet layer.
 func TestReadPacketUnlimitedByDefault(t *testing.T) {
 	payload := bytes.Repeat([]byte("z"), 4096)
 	c := newReadTestConn(mysqlPacket(0, payload), mysql.MYSQL_COMPRESS_NONE)
@@ -375,12 +366,10 @@ func TestReadPacketUnlimitedByDefault(t *testing.T) {
 	require.Equal(t, payload, got)
 }
 
-// TestPacketTooLargeIsBadConn covers the connection-reuse contract. The
-// oversized payload is deliberately left in the stream, so the connection is
-// desynced and must be discarded; callers decide that on ErrBadConn. Both
-// spellings are checked because mysql.ErrorEqual walks pingcap/errors' Cause
-// chain while errors.Is walks Unwrap, and the wrapping in ReadPacketReuseMem
-// sits between the caller and this error.
+// TestPacketTooLargeIsBadConn covers the connection-reuse contract: the stream
+// is desynced, so callers must discard the connection, which they decide on
+// ErrBadConn. Both spellings are checked because ErrorEqual walks Cause while
+// errors.Is walks Unwrap.
 func TestPacketTooLargeIsBadConn(t *testing.T) {
 	c := newReadTestConn(mysqlPacket(0, bytes.Repeat([]byte("x"), 512)), mysql.MYSQL_COMPRESS_NONE)
 	c.MaxAllowedPacket = 16

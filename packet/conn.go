@@ -26,23 +26,14 @@ const (
 	// DefaultReadBufferSize is the bufio.Reader size used by NewConn and
 	// EnableReadBuffering.
 	DefaultReadBufferSize = 64 * 1024
-	// DefaultMaxAllowedPacket mirrors the max_allowed_packet default of a
-	// MySQL 8.0 server (64MiB). A Conn enforces no limit until one is set, so
-	// this is only the value the server package defaults to.
+	// DefaultMaxAllowedPacket is the max_allowed_packet default of a MySQL 8.0 server.
 	DefaultMaxAllowedPacket = 64 << 20
 )
 
-// ErrPacketTooLarge reports a logical packet whose payload exceeded the
-// connection's MaxAllowedPacket. It is the transport-level counterpart of
-// MySQL's ER_NET_PACKET_TOO_LARGE, which the server package raises from it.
-//
-// The offending payload is deliberately not drained: draining would spend our
-// bandwidth on data already refused, which is the cost the limit exists to
-// avoid. The stream is therefore left desynced and the connection cannot be
-// reused, so this wraps mysql.ErrBadConn and existing callers discard the
-// connection as they would on any other read failure. WithMessage is what
-// makes that work in both directions: it reports mysql.ErrBadConn from Cause,
-// for pingcap/errors and mysql.ErrorEqual, and from Unwrap, for errors.Is.
+// ErrPacketTooLarge reports a payload over the connection's MaxAllowedPacket.
+// It wraps mysql.ErrBadConn because the refused payload is not drained, leaving
+// the stream desynced. Not fmt.Errorf: mysql.ErrorEqual needs ErrBadConn
+// reachable through Cause, which only pingcap/errors provides.
 var ErrPacketTooLarge = errors.WithMessage(mysql.ErrBadConn, "packet payload exceeds max allowed packet")
 
 // Conn is the base class to handle MySQL protocol.
@@ -62,9 +53,8 @@ type Conn struct {
 
 	copyNBuf []byte
 
-	// MaxAllowedPacket bounds the reassembled payload of one logical packet, the
-	// way MySQL's max_allowed_packet bounds an inbound packet; 0 or less means
-	// unlimited. Set it before the first read, so the handshake is covered too.
+	// MaxAllowedPacket bounds the reassembled payload of one logical packet; 0 or
+	// less means unlimited. Set it before the first read to cover the handshake.
 	MaxAllowedPacket int
 
 	header [4]byte
@@ -320,13 +310,10 @@ func (c *Conn) copyN(dst io.Writer, n int64) (int64, error) {
 	return written, nil
 }
 
-// ReadPacketTo reads one logical packet into w, reassembling the continuation
-// packets MySQL uses to carry payloads of MaxPayloadLen (16MiB) or more.
-//
-// When MaxAllowedPacket is set, the reassembled payload is bounded by it. The
-// check runs on each continuation's declared length before that payload is read
-// or the destination buffer is grown for it, so refusing an oversized packet
-// costs a 4-byte header rather than the bytes it claims to carry.
+// ReadPacketTo reads one logical packet into w, reassembling the continuations
+// MySQL uses for payloads of MaxPayloadLen (16MiB) or more. MaxAllowedPacket, if
+// set, is checked against each declared length before that payload is read or
+// the buffer is grown for it, so refusing one costs a header and nothing else.
 func (c *Conn) ReadPacketTo(w io.Writer) error {
 	// The peer may be waiting on our buffered output before it sends more.
 	if err := c.Flush(); err != nil {
@@ -338,9 +325,7 @@ func (c *Conn) ReadPacketTo(w io.Writer) error {
 		utils.BytesBufferPut(b)
 	}()
 
-	// Payload accumulated across this logical packet's continuations. int64
-	// because a payload assembled from many 16MiB continuations overflows int32
-	// and, on a 32-bit build, would wrap an int.
+	// int64 because enough 16MiB continuations would wrap a 32-bit int.
 	var payload int64
 
 	for {
@@ -369,8 +354,6 @@ func (c *Conn) ReadPacketTo(w io.Writer) error {
 
 		payload += int64(length)
 		if c.MaxAllowedPacket > 0 && payload > int64(c.MaxAllowedPacket) {
-			// payload is what has been declared so far, up to and including the
-			// continuation that crossed the limit; the peer may have meant to send more.
 			return errors.Wrapf(ErrPacketTooLarge, "%d bytes declared, limit %d", payload, c.MaxAllowedPacket)
 		}
 
@@ -385,8 +368,7 @@ func (c *Conn) ReadPacketTo(w io.Writer) error {
 			return errors.Wrapf(mysql.ErrBadConn, "io.CopyN failed(n != int64(length)). %v bytes copied, while %v expected", n, length)
 		}
 
-		// Only a full-length packet is continued; anything shorter ends the
-		// logical packet.
+		// Only a full-length packet is continued.
 		if length < mysql.MaxPayloadLen {
 			return nil
 		}
