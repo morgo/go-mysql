@@ -3,13 +3,14 @@ package packet
 import (
 	"bufio"
 	"bytes"
-	goErrors "errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
 
 	"github.com/go-mysql-org/go-mysql/compress"
 	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/stretchr/testify/require"
 )
 
 // newReadTestConn builds a Conn whose read side is fed from the given raw bytes,
@@ -321,19 +322,9 @@ func TestReadPacketRefusesOversizedPacketWithoutReadingIt(t *testing.T) {
 	c.MaxAllowedPacket = 64
 
 	_, err := c.ReadPacket()
-	var tooLarge *PacketTooLargeError
-	if !goErrors.As(err, &tooLarge) {
-		t.Fatalf("err = %v, want a *PacketTooLargeError", err)
-	}
-	if tooLarge.Limit != 64 {
-		t.Errorf("Limit = %d, want 64", tooLarge.Limit)
-	}
-	if tooLarge.Size != payloadLen {
-		t.Errorf("Size = %d, want %d", tooLarge.Size, payloadLen)
-	}
-	if r.Len() != payloadLen {
-		t.Errorf("%d payload bytes consumed; want the payload left unread", payloadLen-r.Len())
-	}
+	require.ErrorIs(t, err, ErrPacketTooLarge)
+	require.ErrorContains(t, err, "4096 bytes declared, limit 64")
+	require.Equal(t, payloadLen, r.Len(), "payload bytes were consumed; want the payload left unread")
 }
 
 // TestReadPacketRefusesOversizedContinuation covers the case the per-packet
@@ -350,16 +341,10 @@ func TestReadPacketRefusesOversizedContinuation(t *testing.T) {
 	c.MaxAllowedPacket = mysql.MaxPayloadLen + 128
 
 	_, err := c.ReadPacket()
-	var tooLarge *PacketTooLargeError
-	if !goErrors.As(err, &tooLarge) {
-		t.Fatalf("err = %v, want a *PacketTooLargeError", err)
-	}
-	if want := int64(mysql.MaxPayloadLen + tailLen); tooLarge.Size != want {
-		t.Errorf("Size = %d, want %d", tooLarge.Size, want)
-	}
-	if r.Len() != tailLen {
-		t.Errorf("%d continuation payload bytes consumed; want them left unread", tailLen-r.Len())
-	}
+	require.ErrorIs(t, err, ErrPacketTooLarge)
+	// Neither continuation is oversized on its own; only their sum is.
+	require.ErrorContains(t, err, fmt.Sprintf("%d bytes declared", mysql.MaxPayloadLen+tailLen))
+	require.Equal(t, tailLen, r.Len(), "continuation payload bytes were consumed; want them left unread")
 }
 
 // TestReadPacketMultiPacketPayloadWithinLimit guards the loop rewrite: a payload
@@ -371,18 +356,11 @@ func TestReadPacketMultiPacketPayloadWithinLimit(t *testing.T) {
 	c.MaxAllowedPacket = mysql.MaxPayloadLen + len(tail)
 
 	got, err := c.ReadPacket()
-	if err != nil {
-		t.Fatalf("ReadPacket: %v", err)
-	}
-	if len(got) != mysql.MaxPayloadLen+len(tail) {
-		t.Fatalf("payload length = %d, want %d", len(got), mysql.MaxPayloadLen+len(tail))
-	}
-	if !bytes.Equal(got[mysql.MaxPayloadLen:], tail) {
-		t.Errorf("continuation payload = %q, want %q", got[mysql.MaxPayloadLen:], tail)
-	}
-	if c.Sequence != 2 {
-		t.Errorf("Sequence = %d, want 2 (both packets accounted for)", c.Sequence)
-	}
+	require.NoError(t, err)
+	// Lengths rather than require.Len, so a failure does not dump 16MiB.
+	require.Equal(t, mysql.MaxPayloadLen+len(tail), len(got))
+	require.Equal(t, tail, got[mysql.MaxPayloadLen:], "continuation payload")
+	require.Equal(t, uint8(2), c.Sequence, "both packets should be accounted for")
 }
 
 // TestReadPacketUnlimitedByDefault keeps the limit opt-in at the packet layer, so
@@ -390,37 +368,25 @@ func TestReadPacketMultiPacketPayloadWithinLimit(t *testing.T) {
 func TestReadPacketUnlimitedByDefault(t *testing.T) {
 	payload := bytes.Repeat([]byte("z"), 4096)
 	c := newReadTestConn(mysqlPacket(0, payload), mysql.MYSQL_COMPRESS_NONE)
-	if c.MaxAllowedPacket != 0 {
-		t.Fatalf("MaxAllowedPacket = %d, want 0 (unlimited)", c.MaxAllowedPacket)
-	}
+	require.Zero(t, c.MaxAllowedPacket, "a Conn should start unlimited")
 
 	got, err := c.ReadPacket()
-	if err != nil {
-		t.Fatalf("ReadPacket: %v", err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Errorf("payload mismatch: got %d bytes, want %d", len(got), len(payload))
-	}
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
 }
 
-// TestPacketTooLargeErrorIsBadConn covers the connection-reuse contract. The
+// TestPacketTooLargeIsBadConn covers the connection-reuse contract. The
 // oversized payload is deliberately left in the stream, so the connection is
 // desynced and must be discarded; callers decide that on ErrBadConn. Both
 // spellings are checked because mysql.ErrorEqual walks pingcap/errors' Cause
 // chain while errors.Is walks Unwrap, and the wrapping in ReadPacketReuseMem
 // sits between the caller and this error.
-func TestPacketTooLargeErrorIsBadConn(t *testing.T) {
+func TestPacketTooLargeIsBadConn(t *testing.T) {
 	c := newReadTestConn(mysqlPacket(0, bytes.Repeat([]byte("x"), 512)), mysql.MYSQL_COMPRESS_NONE)
 	c.MaxAllowedPacket = 16
 
 	_, err := c.ReadPacket()
-	if err == nil {
-		t.Fatal("ReadPacket accepted a packet over the limit, want an error")
-	}
-	if !mysql.ErrorEqual(err, mysql.ErrBadConn) {
-		t.Errorf("mysql.ErrorEqual(err, ErrBadConn) = false for %v, want true", err)
-	}
-	if !goErrors.Is(err, mysql.ErrBadConn) {
-		t.Errorf("errors.Is(err, ErrBadConn) = false for %v, want true", err)
-	}
+	require.Error(t, err)
+	require.True(t, mysql.ErrorEqual(err, mysql.ErrBadConn), "mysql.ErrorEqual should see ErrBadConn in %v", err)
+	require.ErrorIs(t, err, mysql.ErrBadConn)
 }

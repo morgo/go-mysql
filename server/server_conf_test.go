@@ -1,12 +1,16 @@
 package server
 
 import (
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/packet"
 	"github.com/stretchr/testify/require"
 )
 
@@ -214,4 +218,133 @@ func TestSetCapabilityRejectsUnsafeFlags(t *testing.T) {
 	require.True(t, svr.Capability()&mysql.CLIENT_LOCAL_FILES != 0)
 	require.NoError(t, svr.UnsetCapability(mysql.CLIENT_LOCAL_FILES))
 	require.False(t, svr.Capability()&mysql.CLIENT_LOCAL_FILES != 0)
+}
+
+// readRawPacket reads one MySQL protocol packet (4-byte header + payload) off
+// the wire. These tests speak the protocol directly rather than through a
+// client, because the point is to send something no client would send.
+func readRawPacket(conn net.Conn) (seq byte, payload []byte, err error) {
+	var hdr [4]byte
+	if _, err = io.ReadFull(conn, hdr[:]); err != nil {
+		return 0, nil, err
+	}
+	length := int(uint32(hdr[0]) | uint32(hdr[1])<<8 | uint32(hdr[2])<<16)
+	payload = make([]byte, length)
+	if _, err = io.ReadFull(conn, payload); err != nil {
+		return 0, nil, err
+	}
+	return hdr[3], payload, nil
+}
+
+// errPacketCode returns the error code carried by an ERR packet.
+func errPacketCode(t *testing.T, payload []byte) uint16 {
+	t.Helper()
+	require.GreaterOrEqual(t, len(payload), 3, "too short to be an ERR packet")
+	require.Equal(t, byte(mysql.ERR_HEADER), payload[0], "packet header should be ERR")
+	return binary.LittleEndian.Uint16(payload[1:3])
+}
+
+// serveOnce accepts one connection and runs the server side of it. The channel
+// carries the handshake error, or — when the handshake succeeds — the result of
+// serving one command.
+func serveOnce(t *testing.T, srv *Server, auth AuthenticationHandler) (addr string, served <-chan error) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+
+	result := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			result <- err
+			return
+		}
+		c, err := srv.NewCustomizedConn(conn, auth, EmptyHandler{})
+		if err != nil {
+			result <- err
+			return
+		}
+		// Handshake succeeded, so the test is exercising the command phase.
+		result <- c.HandleCommand()
+	}()
+	return ln.Addr().String(), result
+}
+
+// TestHandshakeResponseOverMaxAllowedPacket covers the pre-auth exposure. The
+// handshake response is a client-supplied packet read before any credential is
+// checked, so an unlimited server lets an unauthenticated peer decide how much
+// memory it buffers. Only the 4-byte header is sent here: the server must refuse
+// on the declared length alone, without waiting for — or reserving room for —
+// the payload it was promised.
+func TestHandshakeResponseOverMaxAllowedPacket(t *testing.T) {
+	srv := NewDefaultServer()
+	srv.SetMaxAllowedPacket(1024)
+	addr, handshake := serveOnce(t, srv, NewInMemoryAuthenticationHandler())
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(10*time.Second)))
+
+	_, _, err = readRawPacket(conn)
+	require.NoError(t, err, "reading initial handshake")
+
+	// Handshake response declaring an 8KiB payload, sequence 1. No payload follows.
+	_, err = conn.Write([]byte{0x00, 0x20, 0x00, 0x01})
+	require.NoError(t, err, "writing oversized handshake response header")
+
+	_, payload, err := readRawPacket(conn)
+	require.NoError(t, err, "reading error response")
+	require.Equal(t, uint16(mysql.ER_NET_PACKET_TOO_LARGE), errPacketCode(t, payload))
+	require.Error(t, <-handshake, "NewCustomizedConn should reject an oversized handshake response")
+}
+
+// TestServerDefaultsToMySQLMaxAllowedPacket pins the default a server starts
+// with: unlimited reads are the vulnerable configuration, so the constructors
+// must not leave the limit at zero.
+func TestServerDefaultsToMySQLMaxAllowedPacket(t *testing.T) {
+	require.Equal(t, packet.DefaultMaxAllowedPacket, NewDefaultServer().MaxAllowedPacket())
+	srv := NewServer("8.0.11", mysql.DEFAULT_COLLATION_ID, mysql.AUTH_NATIVE_PASSWORD, nil, nil)
+	require.Equal(t, packet.DefaultMaxAllowedPacket, srv.MaxAllowedPacket())
+}
+
+// TestSetMaxAllowedPacketOverridesDefault covers the one thing the setter has to
+// do: replace the default for connections accepted afterwards.
+func TestSetMaxAllowedPacketOverridesDefault(t *testing.T) {
+	srv := NewDefaultServer()
+	srv.SetMaxAllowedPacket(4 << 20)
+	require.Equal(t, 4<<20, srv.MaxAllowedPacket())
+}
+
+// TestCommandOverMaxAllowedPacket covers the command phase, which is where a
+// proxy spends its life: an authenticated client's oversized command must be
+// answered with ER_NET_PACKET_TOO_LARGE, not merely dropped. Only the header is
+// sent, so the server also has to refuse without waiting for the payload.
+func TestCommandOverMaxAllowedPacket(t *testing.T) {
+	srv := NewDefaultServer()
+	srv.SetMaxAllowedPacket(1024)
+	auth := NewInMemoryAuthenticationHandler()
+	require.NoError(t, auth.AddUser("packetuser", "packetpass"))
+	addr, served := serveOnce(t, srv, auth)
+
+	c, err := client.Connect(addr, "packetuser", "packetpass", "")
+	require.NoError(t, err)
+	defer c.Close()
+	// A server that failed to refuse would block reading the payload the header
+	// promised, so bound the read: the failure mode should be a failing test,
+	// not a hanging one.
+	require.NoError(t, c.Conn.Conn.SetDeadline(time.Now().Add(10*time.Second)))
+
+	// A command declaring a 4MiB payload, sequence 0. Written under the client's
+	// packet layer so no payload follows; the client's sequence is advanced by
+	// hand to match what the server will reply with.
+	_, err = c.Conn.Conn.Write([]byte{0x00, 0x00, 0x40, 0x00})
+	require.NoError(t, err, "writing oversized command header")
+	c.Sequence = 1
+
+	payload, err := c.ReadPacket()
+	require.NoError(t, err, "reading error response")
+	require.Equal(t, uint16(mysql.ER_NET_PACKET_TOO_LARGE), errPacketCode(t, payload))
+	require.Error(t, <-served, "HandleCommand should reject an oversized command")
 }

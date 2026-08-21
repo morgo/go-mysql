@@ -2,10 +2,12 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/packet"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/go-mysql-org/go-mysql/stmt"
 	"github.com/go-mysql-org/go-mysql/utils"
@@ -55,8 +57,8 @@ func (c *Conn) HandleCommand() error {
 		// it: send ER_NET_PACKET_TOO_LARGE, then close. The oversized payload
 		// was not drained, so the stream is desynced and the connection cannot
 		// carry another command regardless.
-		if e, ok := asPacketTooLarge(err); ok {
-			if writeErr := c.writeError(e); writeErr == nil {
+		if errors.Is(err, packet.ErrPacketTooLarge) {
+			if writeErr := c.writeError(mysql.NewDefaultError(mysql.ER_NET_PACKET_TOO_LARGE)); writeErr == nil {
 				_ = c.Flush()
 			}
 		}

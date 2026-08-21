@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	goErrors "errors"
-	"fmt"
 	"io"
 	"net"
 	"time"
@@ -33,34 +32,18 @@ const (
 	DefaultMaxAllowedPacket = 64 << 20
 )
 
-// PacketTooLargeError reports a logical packet whose payload exceeded the
+// ErrPacketTooLarge reports a logical packet whose payload exceeded the
 // connection's MaxAllowedPacket. It is the transport-level counterpart of
-// MySQL's ER_NET_PACKET_TOO_LARGE.
+// MySQL's ER_NET_PACKET_TOO_LARGE, which the server package raises from it.
 //
 // The offending payload is deliberately not drained: draining would spend our
 // bandwidth on data already refused, which is the cost the limit exists to
 // avoid. The stream is therefore left desynced and the connection cannot be
-// reused, so this error reports mysql.ErrBadConn as its cause — existing
-// callers discard the connection as they would on any other read failure.
-type PacketTooLargeError struct {
-	// Size is the payload accounted for when the limit tripped: the summed
-	// declared lengths of this packet's continuations up to and including the
-	// one that crossed the limit. The peer may have intended to send more.
-	Size int64
-	// Limit is the MaxAllowedPacket that was exceeded.
-	Limit int
-}
-
-func (e *PacketTooLargeError) Error() string {
-	return fmt.Sprintf("packet payload of %d bytes exceeds max allowed packet of %d bytes", e.Size, e.Limit)
-}
-
-// Cause and Unwrap both report mysql.ErrBadConn: the two spellings cover
-// pingcap/errors' Cause chain and the standard errors.Is/As chain, so callers
-// using either see a bad connection while still being able to errors.As their
-// way to this type for the ER_NET_PACKET_TOO_LARGE code.
-func (e *PacketTooLargeError) Cause() error  { return mysql.ErrBadConn }
-func (e *PacketTooLargeError) Unwrap() error { return mysql.ErrBadConn }
+// reused, so this wraps mysql.ErrBadConn and existing callers discard the
+// connection as they would on any other read failure. WithMessage is what
+// makes that work in both directions: it reports mysql.ErrBadConn from Cause,
+// for pingcap/errors and mysql.ErrorEqual, and from Unwrap, for errors.Is.
+var ErrPacketTooLarge = errors.WithMessage(mysql.ErrBadConn, "packet payload exceeds max allowed packet")
 
 // Conn is the base class to handle MySQL protocol.
 type Conn struct {
@@ -386,7 +369,9 @@ func (c *Conn) ReadPacketTo(w io.Writer) error {
 
 		payload += int64(length)
 		if c.MaxAllowedPacket > 0 && payload > int64(c.MaxAllowedPacket) {
-			return &PacketTooLargeError{Size: payload, Limit: c.MaxAllowedPacket}
+			// payload is what has been declared so far, up to and including the
+			// continuation that crossed the limit; the peer may have meant to send more.
+			return errors.Wrapf(ErrPacketTooLarge, "%d bytes declared, limit %d", payload, c.MaxAllowedPacket)
 		}
 
 		if buf, ok := w.(*bytes.Buffer); ok {
