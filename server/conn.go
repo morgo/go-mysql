@@ -78,7 +78,7 @@ func (s *Server) NewCustomizedConn(conn net.Conn, authHandler AuthenticationHand
 	// Set before handshake(): the handshake response is itself a client-supplied
 	// packet, so an unauthenticated peer would otherwise be able to make us
 	// buffer without bound before it has proved anything.
-	packetConn.MaxAllowedPacket = s.maxAllowedPacket
+	packetConn.MaxAllowedPacket = s.MaxAllowedPacket
 
 	c := &Conn{
 		Conn:         packetConn,

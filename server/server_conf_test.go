@@ -279,7 +279,7 @@ func serveOnce(t *testing.T, srv *Server, auth AuthenticationHandler) (addr stri
 // the payload it was promised.
 func TestHandshakeResponseOverMaxAllowedPacket(t *testing.T) {
 	srv := NewDefaultServer()
-	srv.SetMaxAllowedPacket(1024)
+	srv.MaxAllowedPacket = 1024
 	addr, handshake := serveOnce(t, srv, NewInMemoryAuthenticationHandler())
 
 	conn, err := net.Dial("tcp", addr)
@@ -304,17 +304,9 @@ func TestHandshakeResponseOverMaxAllowedPacket(t *testing.T) {
 // with: unlimited reads are the vulnerable configuration, so the constructors
 // must not leave the limit at zero.
 func TestServerDefaultsToMySQLMaxAllowedPacket(t *testing.T) {
-	require.Equal(t, packet.DefaultMaxAllowedPacket, NewDefaultServer().MaxAllowedPacket())
+	require.Equal(t, packet.DefaultMaxAllowedPacket, NewDefaultServer().MaxAllowedPacket)
 	srv := NewServer("8.0.11", mysql.DEFAULT_COLLATION_ID, mysql.AUTH_NATIVE_PASSWORD, nil, nil)
-	require.Equal(t, packet.DefaultMaxAllowedPacket, srv.MaxAllowedPacket())
-}
-
-// TestSetMaxAllowedPacketOverridesDefault covers the one thing the setter has to
-// do: replace the default for connections accepted afterwards.
-func TestSetMaxAllowedPacketOverridesDefault(t *testing.T) {
-	srv := NewDefaultServer()
-	srv.SetMaxAllowedPacket(4 << 20)
-	require.Equal(t, 4<<20, srv.MaxAllowedPacket())
+	require.Equal(t, packet.DefaultMaxAllowedPacket, srv.MaxAllowedPacket)
 }
 
 // TestCommandOverMaxAllowedPacket covers the command phase, which is where a
@@ -323,7 +315,7 @@ func TestSetMaxAllowedPacketOverridesDefault(t *testing.T) {
 // sent, so the server also has to refuse without waiting for the payload.
 func TestCommandOverMaxAllowedPacket(t *testing.T) {
 	srv := NewDefaultServer()
-	srv.SetMaxAllowedPacket(1024)
+	srv.MaxAllowedPacket = 1024
 	auth := NewInMemoryAuthenticationHandler()
 	require.NoError(t, auth.AddUser("packetuser", "packetpass"))
 	addr, served := serveOnce(t, srv, auth)

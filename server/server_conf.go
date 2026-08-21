@@ -45,7 +45,16 @@ type Server struct {
 	tlsConfig         *tls.Config
 	cacheShaPassword  *sync.Map // 'user@host' -> SHA256(SHA256(PASSWORD))
 	authProvider      AuthenticationProvider
-	maxAllowedPacket  int
+
+	// MaxAllowedPacket bounds the payload of a single inbound packet, the way
+	// MySQL's max_allowed_packet does: a client that exceeds it gets
+	// ER_NET_PACKET_TOO_LARGE and its connection is closed. It defaults to
+	// packet.DefaultMaxAllowedPacket.
+	//
+	// Assign it during setup. It is read on every accept without
+	// synchronisation, and 0 or less disables the limit, which lets any peer,
+	// including an unauthenticated one, make the server buffer without bound.
+	MaxAllowedPacket int
 }
 
 // NewDefaultServer: New mysql server with default settings.
@@ -57,8 +66,8 @@ type Server struct {
 // identity for maximum security, you need to set a signed certificate for the client.
 //
 // Inbound packets are limited to packet.DefaultMaxAllowedPacket, matching a
-// MySQL 8.0 server's max_allowed_packet. Raise it with SetMaxAllowedPacket if
-// clients legitimately send larger payloads.
+// MySQL 8.0 server's max_allowed_packet. Raise MaxAllowedPacket if clients
+// legitimately send larger payloads.
 func NewDefaultServer() *Server {
 	caPem, caKey := generateCA()
 	certPem, keyPem := generateAndSignRSACerts(caPem, caKey)
@@ -78,7 +87,7 @@ func NewDefaultServer() *Server {
 		tlsConfig:         tlsConf,
 		cacheShaPassword:  new(sync.Map),
 		authProvider:      &DefaultAuthenticationProvider{},
-		maxAllowedPacket:  packet.DefaultMaxAllowedPacket,
+		MaxAllowedPacket:  packet.DefaultMaxAllowedPacket,
 	}
 }
 
@@ -133,7 +142,7 @@ func NewServerWithAuth(serverVersion string, collationID uint8, defaultAuthMetho
 		tlsConfig:         tlsConfig,
 		cacheShaPassword:  new(sync.Map),
 		authProvider:      authProvider,
-		maxAllowedPacket:  packet.DefaultMaxAllowedPacket,
+		MaxAllowedPacket:  packet.DefaultMaxAllowedPacket,
 	}
 }
 
@@ -181,23 +190,6 @@ func (s *Server) UnsetCapability(capability uint32) error {
 		}
 	}
 	return nil
-}
-
-// MaxAllowedPacket returns the inbound payload limit applied to connections
-// this server accepts, or 0 if reads are unlimited.
-func (s *Server) MaxAllowedPacket() int {
-	return s.maxAllowedPacket
-}
-
-// SetMaxAllowedPacket bounds the payload of a single inbound packet, the way
-// MySQL's max_allowed_packet does: a client that exceeds it gets
-// ER_NET_PACKET_TOO_LARGE and its connection is closed.
-//
-// Call it during setup — the value is read on every accept and stored without
-// synchronisation. 0 or less disables the limit, which lets any peer, including
-// an unauthenticated one, make the server buffer without bound.
-func (s *Server) SetMaxAllowedPacket(n int) {
-	s.maxAllowedPacket = n
 }
 
 func validateUserConfigurableCapability(capability uint32) error {
